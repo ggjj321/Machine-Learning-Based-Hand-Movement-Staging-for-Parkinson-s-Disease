@@ -1,0 +1,63 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Model Checkpoints
+acgn_exp/checkpoints/
+acgn_exp/checkpoints_feature/
+acgn_exp/hor_acgn_linear_sep_checkpoints/
+acgn_exp/hor_checkpoints/
+acgn_exp/old_checkpoints/
+*.pt
+*.pth
+
+# Datasets and Data Files
+acgn_exp/horizontal_view/
+acgn_exp/skeleton_sequences_4_to_8/
+*.csv
+
+# Evaluation and Outputs
+acgn_exp/cross_eval_results/
+*.png
+
+# Rendered HTML and Visualization
+*_files/
+*.html
+
+# Papers and Documents
+*.pdf
