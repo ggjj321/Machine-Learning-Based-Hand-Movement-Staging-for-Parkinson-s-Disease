@@ -342,6 +342,8 @@ def main():
     parser.add_argument('--mode', type=str, choices=['standard', 'stacked', 'both'], default='both', help="Which LOOCV mode to run: standard mix, left/right stacked, or both")
     parser.add_argument('--save_dir', type=str, default='xgb_exp/results', help="Directory to save plots and metrics")
     parser.add_argument('--no_show', action='store_true', help="Do not display plots (useful for headless environments)")
+    parser.add_argument('--add_diff_features', action='store_true', help="Add left-right difference features (L - R)")
+    parser.add_argument('--diff_abs', action='store_true', help="Use absolute difference |L - R| instead of L - R")
     
     args = parser.parse_args()
     
@@ -390,6 +392,20 @@ def main():
 
         X_all = df_subset.drop(columns=[c for c in metadata_cols if c in df_subset.columns])
         X_all = X_all.select_dtypes(include=[np.number]).reset_index(drop=True)
+
+        if args.add_diff_features:
+            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
+            diff_count = 0
+            for l_col in left_cols:
+                r_col = 'R_' + l_col[2:]
+                if r_col in X_all.columns:
+                    diff_colname = 'Diff_' + l_col[2:]
+                    if args.diff_abs:
+                        X_all[diff_colname] = (X_all[l_col] - X_all[r_col]).abs()
+                    else:
+                        X_all[diff_colname] = X_all[l_col] - X_all[r_col]
+                    diff_count += 1
+            print(f"已新增 {diff_count} 個左右手差距特徵 (Diff_)。總特徵數: {X_all.shape[1]}")
 
         if args.mode in ['standard', 'both']:
             run_standard_loocv(X_all, y_binary, y_multi, args, source_name, fs_methods)
