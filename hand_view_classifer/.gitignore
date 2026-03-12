@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb
+# datasets / models output
+*.pt
+*.mp4
+
+# Project specific folders
+classified_hand_videos/
+classified_hand_videos_*/
+raw_hand_videos/
+right_hand_files_*/
+Individual_handling_video/
+Individual_handling_video_*/
+skeleton_sequences/
+skeleton_sequences_*/
+
+# Data files containing potential PII
+*.csv
+*.xlsx
+
+# System
+.DS_Store
