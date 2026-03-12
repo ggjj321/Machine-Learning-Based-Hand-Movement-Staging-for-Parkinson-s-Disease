@@ -36,6 +36,7 @@ htmlcov/
 .tox/
 .nox/
 .hypothesis/
+*.ipynb
 
 # Model Checkpoints
 acgn_exp/checkpoints/
@@ -50,6 +51,18 @@ acgn_exp/old_checkpoints/
 acgn_exp/horizontal_view/
 acgn_exp/skeleton_sequences_4_to_8/
 *.csv
+*.xlsx
+*.mp4
+
+# Project specific folders (hand-view_classifier)
+classified_hand_videos/
+classified_hand_videos_*/
+raw_hand_videos/
+right_hand_files_*/
+Individual_handling_video/
+Individual_handling_video_*/
+skeleton_sequences/
+skeleton_sequences_*/
 
 # Evaluation and Outputs
 acgn_exp/cross_eval_results/
