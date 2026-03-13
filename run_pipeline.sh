@@ -29,7 +29,7 @@ CLASSIFIED_DIR="${HAND_VIEW_DIR}/classified_hand_videos"
 RAW_SKELETON_ZIP="${HAND_VIEW_DIR}/skeleton.zip"
 SKELETON_DIR="${HAND_VIEW_DIR}/skeleton_sequences"
 HORIZONTAL_SKELETON_DIR="${SKELETON_DIR}/horizontal_view"
-FEATURE_OUTPUT="${HAND_VIEW_DIR}/extracted_features.csv"
+FEATURE_OUTPUT="extracted_features.csv"
 
 # Global Paths
 CSV_METADATA="收案_CAREs 20251009-加密 - deID.csv"

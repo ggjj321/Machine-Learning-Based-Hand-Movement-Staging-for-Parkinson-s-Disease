@@ -360,10 +360,10 @@ def main():
             feature_names = names
             
         row_data = {
-            'Date': p.date,
-            'PID': p.patient_id,
-            'PD_Stage': p.pd_stage,
-            'On_Medication': p.on_medication
+            'patient_id': p.patient_id,
+            'pd_stage': p.pd_stage,
+            'on_medication': p.on_medication,
+            'dataset_source': 'horizontal'  # Default for this pipeline
         }
         
         for name, val in zip(names, feats):
