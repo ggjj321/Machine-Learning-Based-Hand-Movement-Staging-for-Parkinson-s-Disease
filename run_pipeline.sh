@@ -139,7 +139,7 @@ if __name__ == "__main__":
     main()
 EOF
 
-    python3 temp_classify.py "$EXTRACTED_SUBDIR" "$CLASSIFIED_DIR"
+    python temp_classify.py "$EXTRACTED_SUBDIR" "$CLASSIFIED_DIR"
     rm temp_classify.py
 
     echo -e "\n---> Step 4: Extracting 3D Skeleton Sequences..."
@@ -148,7 +148,7 @@ EOF
         exit 1
     fi
 
-    python3 "${HAND_VIEW_DIR}/process_videos_to_skeleton.py" \
+    python "${HAND_VIEW_DIR}/process_videos_to_skeleton.py" \
         --mode all \
         --csv "$CSV_METADATA" \
         --input_dir "$CLASSIFIED_DIR" \
@@ -193,9 +193,9 @@ if [ ! -f "$CSV_METADATA" ]; then
     exit 1
 fi
 
-python3 "${HAND_VIEW_DIR}/extract_features.py" \
+python "${HAND_VIEW_DIR}/extract_features.py" \
     --csv "$CSV_METADATA" \
-    --pt_dir "/home/azureuser/.openclaw/workspace/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/hand_view_classifer/skeleton_sequences_4_to_8/skeleton_sequences_4_to_8" \
+    --pt_dir "./hand_view_classifer/skeleton_sequences/skeleton_sequences_4_to_8/horizontal_view" \
     --output "$FEATURE_OUTPUT"
 
 
@@ -210,7 +210,7 @@ if [ ! -f "$XGB_EVAL_SCRIPT" ]; then
      exit 1
 fi
 
-python3 "$XGB_EVAL_SCRIPT" \
+python "$XGB_EVAL_SCRIPT" \
     --csv_path "$FEATURE_OUTPUT" \
     --k_features 10 \
     --use_youden \

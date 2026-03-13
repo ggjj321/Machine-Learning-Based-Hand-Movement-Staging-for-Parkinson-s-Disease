@@ -345,7 +345,7 @@ def main():
     pt_base_dirs = [d.strip() for d in args.pt_dir.split(',')]
     
     # User specifically requested reading from this folder
-    hardcoded_dir = "/home/azureuser/.openclaw/workspace/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/hand_view_classifer/skeleton_sequences_4_to_8/skeleton_sequences_4_to_8"
+    hardcoded_dir = "./hand_view_classifer/skeleton_sequences/skeleton_sequences_4_to_8/horizontal_view"
     if hardcoded_dir not in pt_base_dirs:
         pt_base_dirs.append(hardcoded_dir)
     
@@ -365,6 +365,7 @@ def main():
     
     for p in patients:
         feats, names = extract_features_from_patient(p)
+        print(f"Extracted features for patient {p.patient_id}")
         if feature_names is None:
             feature_names = names
             
