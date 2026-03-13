@@ -13,7 +13,7 @@ print("=" * 70)
 print("讀取 .pt 檔案")
 print("=" * 70)
 
-data = torch.load(pt_file_path)
+data = torch.load(pt_file_path, weights_only=False)
 
 print("\n檔案內容:")
 print("-" * 70)

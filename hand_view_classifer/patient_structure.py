@@ -40,8 +40,8 @@ class PDPatient:
         :param left_pt_path: 左手軌跡的.pt文件路徑
         :param right_pt_path: 右手軌跡的.pt文件路徑
         """
-        left = torch.load(left_pt_path)
-        right = torch.load(right_pt_path)
+        left = torch.load(left_pt_path, weights_only=False)
+        right = torch.load(right_pt_path, weights_only=False)
         return cls(patient_id, pd_stage, date, on_medication, left, right)
 
     def __repr__(self) -> str:

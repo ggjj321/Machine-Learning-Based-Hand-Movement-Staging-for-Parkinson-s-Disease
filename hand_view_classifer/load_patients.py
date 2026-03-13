@@ -155,8 +155,8 @@ class PatientLoader:
             
             # Load skeleton data
             try:
-                left_data = torch.load(hands['左手'])
-                right_data = torch.load(hands['右手'])
+                left_data = torch.load(hands['左手'], map_location='cpu', weights_only=False)
+                right_data = torch.load(hands['右手'], map_location='cpu', weights_only=False)
                 
                 # Extract skeleton_sequence tensor from the saved dict
                 left_trajectory = left_data['skeleton_sequence']

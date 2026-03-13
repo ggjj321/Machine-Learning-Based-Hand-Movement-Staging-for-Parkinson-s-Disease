@@ -24,8 +24,8 @@ class PDPatient:
         
         # 載入 .pt 檔案 / Load .pt files
         # 為了相容新舊版本，處理兩種格式：包含 meta 資訊的 dict 或純 tensor
-        left_data = torch.load(left_pt_path, map_location='cpu')
-        right_data = torch.load(right_pt_path, map_location='cpu')
+        left_data = torch.load(left_pt_path, map_location='cpu', weights_only=False)
+        right_data = torch.load(right_pt_path, map_location='cpu', weights_only=False)
         
         if isinstance(left_data, dict) and 'skeleton_sequence' in left_data:
             patient.left_trajectory = left_data['skeleton_sequence']
