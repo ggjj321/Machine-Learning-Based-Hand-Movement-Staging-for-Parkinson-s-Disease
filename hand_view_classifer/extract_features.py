@@ -65,6 +65,8 @@ def find_pt_file(base_dirs: List[str], date_str: str, patient_id: str, hand_suff
         for file_path in base_path.rglob("*.pt"):
             if "__MACOSX" in file_path.parts:
                 continue
+            if file_path.name.startswith("._"):
+                continue
             possible_files.append(file_path)
             
     # File name example: 2025-04-18 14:36:55_gesture_20250418_093409__128_左手旋轉_REC_...pt
@@ -341,6 +343,11 @@ def main():
     args = parser.parse_args()
     
     pt_base_dirs = [d.strip() for d in args.pt_dir.split(',')]
+    
+    # User specifically requested reading from this folder
+    hardcoded_dir = "/home/azureuser/.openclaw/workspace/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/hand_view_classifer/skeleton_sequences_4_to_8/skeleton_sequences_4_to_8"
+    if hardcoded_dir not in pt_base_dirs:
+        pt_base_dirs.append(hardcoded_dir)
     
     print(f"Loading patient data from {args.csv}")
     print(f"Searching for .pt files in {pt_base_dirs}...")

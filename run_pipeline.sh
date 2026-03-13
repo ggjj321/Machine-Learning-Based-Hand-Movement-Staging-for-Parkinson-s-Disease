@@ -195,7 +195,7 @@ fi
 
 python3 "${HAND_VIEW_DIR}/extract_features.py" \
     --csv "$CSV_METADATA" \
-    --pt_dir "$HORIZONTAL_SKELETON_DIR" \
+    --pt_dir "/home/azureuser/.openclaw/workspace/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/hand_view_classifer/skeleton_sequences_4_to_8/skeleton_sequences_4_to_8" \
     --output "$FEATURE_OUTPUT"
 
 
