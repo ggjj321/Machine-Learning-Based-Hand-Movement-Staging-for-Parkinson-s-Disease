@@ -63,6 +63,8 @@ def find_pt_file(base_dirs: List[str], date_str: str, patient_id: str, hand_suff
             
         # 搜尋所有 stage 子資料夾，或是如果只有一層結構也一起收納
         for file_path in base_path.rglob("*.pt"):
+            if "__MACOSX" in file_path.parts:
+                continue
             possible_files.append(file_path)
             
     # File name example: 2025-04-18 14:36:55_gesture_20250418_093409__128_左手旋轉_REC_...pt
