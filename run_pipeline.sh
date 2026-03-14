@@ -153,7 +153,7 @@ EOF
         --csv "$CSV_METADATA" \
         --input_dir "$CLASSIFIED_DIR" \
         --output_dir "$SKELETON_DIR"
-
+ 
 elif [ "$PIPELINE_MODE" == "SKELETON" ]; then
     # ==============================
     # SKELETON WORKFLOW

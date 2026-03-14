@@ -300,10 +300,13 @@ def extract_features_from_patient(p: PDPatient) -> Tuple[np.ndarray, List[str]]:
 
     for hand_label, arr in [('L', L), ('R', R)]:
         p0 = arr[:, 0, :]
-        p4 = arr[:, 4, :]
+        p9 = arr[:, 9, :]
         
-        # dist is used as a normalizing factor per frame
-        dist = np.linalg.norm(p4 - p0, axis=1)
+        # dist_scalar is used as a normalizing factor for the entire sequence
+        # We use the median distance between wrist (0) and middle finger mcp (9)
+        dists = np.linalg.norm(p9 - p0, axis=1)
+        dist_scalar = np.median(dists)
+        dist_array = np.full(len(dists), dist_scalar)
 
         for j in range(21):
             for a, axis_name in enumerate(['x', 'y', 'z']):
@@ -319,8 +322,8 @@ def extract_features_from_patient(p: PDPatient) -> Tuple[np.ndarray, List[str]]:
                     wave,
                     w_extrema=10,
                     window=None,
-                    detrend_order=None,
-                    dist=dist
+                    detrend_order=10,
+                    dist=dist_array
                 )
                 
                 method_keys = ['cycle_amp', 'rolling_p2p', 'rms', 'hilbert']
