@@ -235,6 +235,100 @@ def run_stacked_loocv(X_left, X_right, y_binary, args, dataset_name, fs_methods)
 
         print_top_features({f"{fs_name} Left": left_feature_counter, f"{fs_name} Right": right_feature_counter}, args.k_features, len(y_binary))
 
+
+# ==========================================
+# 5b. 評估流程：Asymmetric Stacking LOOCV
+#     （左手為主 + 右手輔助 + 差異特徵捕捉不對稱性）
+# ==========================================
+def run_asymmetric_stacked_loocv(X_left, X_right, y_binary, args, dataset_name, fs_methods):
+    n_samples = len(y_binary)
+    print(f"\n--- 開始執行 Asymmetric Stacked LOOCV (左手主導 + 右手輔助 + 差異特徵，總樣本數: {n_samples}) ---")
+
+    # 建立差異特徵：根據欄位名稱配對 L_ 與 R_
+    left_col_names = list(X_left.columns)
+    right_col_names = list(X_right.columns)
+    # 建立名稱映射：去掉 L_/R_ prefix 後對齊
+    left_suffix = {c[2:]: c for c in left_col_names if c.startswith('L_')}
+    right_suffix = {c[2:]: c for c in right_col_names if c.startswith('R_')}
+    common_suffixes = sorted(set(left_suffix.keys()) & set(right_suffix.keys()))
+
+    diff_data = pd.DataFrame(index=X_left.index)
+    for suffix in common_suffixes:
+        diff_data[f'Diff_{suffix}'] = X_left[left_suffix[suffix]].values - X_right[right_suffix[suffix]].values
+    print(f"差異特徵數量: {diff_data.shape[1]}")
+
+    loo = LeaveOneOut()
+
+    for fs_name, fs_func in fs_methods:
+        print(f"\n[Asymmetric - {fs_name}] 正在處理中...")
+
+        prob_left_oof = np.zeros(n_samples)
+        prob_right_oof = np.zeros(n_samples)
+        prob_diff_oof = np.zeros(n_samples)
+
+        left_feature_counter = Counter()
+        right_feature_counter = Counter()
+        diff_feature_counter = Counter()
+
+        # ----- 第一階段：三個分支分別計算 OOF 預測 -----
+        for train_index, test_index in tqdm(loo.split(X_left), total=n_samples, desc="Stage 1 (3-branch)"):
+            X_l_train, X_l_test = X_left.iloc[train_index], X_left.iloc[test_index]
+            X_r_train, X_r_test = X_right.iloc[train_index], X_right.iloc[test_index]
+            X_d_train, X_d_test = diff_data.iloc[train_index], diff_data.iloc[test_index]
+            y_train = y_binary.iloc[train_index].values
+
+            # 左手（主要分支）
+            prob_left_oof[test_index] = train_and_predict_xgb(
+                X_l_train, y_train, X_l_test, fs_func, args.k_features, left_feature_counter)
+
+            # 右手（輔助分支）
+            prob_right_oof[test_index] = train_and_predict_xgb(
+                X_r_train, y_train, X_r_test, fs_func, args.k_features, right_feature_counter)
+
+            # 差異特徵（不對稱性分支）
+            prob_diff_oof[test_index] = train_and_predict_xgb(
+                X_d_train, y_train, X_d_test, fs_func, args.k_features, diff_feature_counter)
+
+        # ----- 第二階段：LogisticRegression Stacking -----
+        X_meta = np.vstack((prob_left_oof, prob_right_oof, prob_diff_oof)).T
+        prob_final_oof = np.zeros(n_samples)
+
+        # 同時記錄每一 fold 的 stacking 權重
+        stacking_coefs = []
+
+        for train_index, test_index in loo.split(X_meta):
+            X_meta_train, X_meta_test = X_meta[train_index], X_meta[test_index]
+            y_train = y_binary.iloc[train_index].values
+
+            meta_model = LogisticRegression(C=1.0, solver='lbfgs', max_iter=1000)
+            meta_model.fit(X_meta_train, y_train)
+
+            prob_final_oof[test_index] = meta_model.predict_proba(X_meta_test)[:, 1][0]
+            stacking_coefs.append(meta_model.coef_[0].copy())
+
+        # 印出平均 stacking 權重
+        avg_coefs = np.mean(stacking_coefs, axis=0)
+        print(f"\n[Asymmetric Stacking 平均權重]")
+        print(f"  Left Hand  : {avg_coefs[0]:.4f}")
+        print(f"  Right Hand : {avg_coefs[1]:.4f}")
+        print(f"  Diff (L-R) : {avg_coefs[2]:.4f}")
+
+        # 整理給繪圖函式的資料結構
+        models_to_eval = {
+            f'{fs_name} - Left Hand':  {'y_true': y_binary.values, 'y_prob': prob_left_oof},
+            f'{fs_name} - Right Hand': {'y_true': y_binary.values, 'y_prob': prob_right_oof},
+            f'{fs_name} - Diff (L-R)': {'y_true': y_binary.values, 'y_prob': prob_diff_oof},
+            f'{fs_name} - Asymmetric Stack': {'y_true': y_binary.values, 'y_prob': prob_final_oof},
+        }
+
+        plot_and_report_results(models_to_eval, f"Asymmetric_{fs_name}", dataset_name, args, grid_layout=True)
+
+        print_top_features({
+            f"{fs_name} Left": left_feature_counter,
+            f"{fs_name} Right": right_feature_counter,
+            f"{fs_name} Diff": diff_feature_counter,
+        }, args.k_features, len(y_binary))
+
 # ==========================================
 # 6. 視覺化及輸出輔助函式
 # ==========================================
@@ -339,7 +433,7 @@ def main():
     parser.add_argument('--k_features', type=int, default=10, help="Number of top features to select")
     parser.add_argument('--use_youden', action='store_true', help="Enable Youden's J Index for threshold optimization")
     parser.add_argument('--dataset_source', type=str, choices=['horizontal', 'old', 'all'], default='all', help="Filter by dataset source")
-    parser.add_argument('--mode', type=str, choices=['standard', 'stacked', 'both'], default='both', help="Which LOOCV mode to run: standard mix, left/right stacked, or both")
+    parser.add_argument('--mode', type=str, choices=['standard', 'stacked', 'asymmetric', 'both', 'all'], default='both', help="Which LOOCV mode to run: standard, stacked, asymmetric, both (standard+stacked), or all")
     parser.add_argument('--save_dir', type=str, default='xgb_exp/results', help="Directory to save plots and metrics")
     parser.add_argument('--no_show', action='store_true', help="Do not display plots (useful for headless environments)")
     parser.add_argument('--add_diff_features', action='store_true', help="Add left-right difference features (L - R)")
@@ -421,6 +515,17 @@ def main():
                 X_left = X_all[left_cols]
                 X_right = X_all[right_cols]
                 run_stacked_loocv(X_left, X_right, y_binary, args, source_name, fs_methods)
+
+        if args.mode in ['asymmetric', 'all']:
+            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
+
+            if len(left_cols) == 0 or len(right_cols) == 0:
+                print(f"警告：資料集 {source_name} 找不到具有 'L_' 或 'R_' 標註的左右手特徵。已跳過 Asymmetric 模式。")
+            else:
+                X_left = X_all[left_cols]
+                X_right = X_all[right_cols]
+                run_asymmetric_stacked_loocv(X_left, X_right, y_binary, args, source_name, fs_methods)
 
 if __name__ == "__main__":
     main()

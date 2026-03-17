@@ -141,6 +141,114 @@ def load_patients_from_csv(csv_path: str, pt_base_dirs: List[str]) -> List[PDPat
     return patients
 
 
+def find_pt_file_2020(base_dirs: List[str], date_str: str, patient_id: str, hand_suffix: str) -> Optional[str]:
+    """
+    尋找 2020 格式的 .pt 檔案。
+    檔名格式：{date}_{pid}A_{L/R}.pt, {date}_{pid}ABC_{L/R}.pt, {date}_{pid}_{L/R}.pt
+              或帶有 _1, _2 等後綴, 例如 {date}_{pid}A_1_{L/R}.pt
+    目錄結構：stage_X/{filename}.pt
+    """
+    possible_files = []
+    for bdir in base_dirs:
+        base_path = Path(bdir)
+        if not base_path.exists():
+            continue
+        for file_path in base_path.rglob("*.pt"):
+            if "__MACOSX" in file_path.parts:
+                continue
+            if file_path.name.startswith("._"):
+                continue
+            possible_files.append(file_path)
+
+    # 匹配: {date}_{pid}後面可能接 A/ABC/空 + 可能的 _1/_2 + _{L/R}.pt
+    # 例如: 20200429_1A_L.pt, 20200514_10ABC_L.pt, 20200430_1_L.pt, 20200618_16A_1_L.pt
+    pattern = re.compile(
+        rf"^{re.escape(date_str)}_0*{re.escape(patient_id)}[A-Z]*(?:_\d+)?_{re.escape(hand_suffix)}\.pt$"
+    )
+
+    matches = [f for f in possible_files if pattern.search(f.name)]
+
+    if len(matches) >= 1:
+        if len(matches) > 1:
+            print(f"Warning: Multiple 2020 matches for {date_str}_{patient_id}*_{hand_suffix}: "
+                  f"{[m.name for m in matches]}. Using the first one.")
+        return str(matches[0])
+    return None
+
+
+def load_patients_from_2020_csv(csv_path: str, pt_base_dirs: List[str]) -> List[PDPatient]:
+    """
+    載入 2020 資料集格式的 CSV。
+    CSV 欄位: Date, PID, PD Stages, medcine
+    .pt 檔案命名: {date}_{pid}A_L.pt / _R.pt (在 stage_X/ 子資料夾)
+    """
+    patients = []
+    try:
+        df = pd.read_csv(csv_path)
+        print(f"成功讀取 2020 CSV: {csv_path}, 形狀: {df.shape}")
+    except Exception as e:
+        print(f"Failed to read 2020 CSV {csv_path}: {e}")
+        return patients
+
+    required_cols = ['Date', 'PID', 'PD Stages']
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"Error: Column '{col}' not found in 2020 CSV. Available: {list(df.columns)}")
+            return patients
+
+    loaded_count = 0
+    skipped_count = 0
+
+    for index, row in df.iterrows():
+        date_raw = row.get('Date')
+        pid_raw = row.get('PID')
+        pd_stage_raw = row.get('PD Stages')
+        medicine_raw = row.get('medcine')
+
+        if pd.isna(date_raw) or pd.isna(pid_raw):
+            continue
+
+        date_str = str(int(date_raw)) if isinstance(date_raw, float) else str(date_raw).strip()
+        patient_id = str(int(pid_raw)) if isinstance(pid_raw, float) else str(pid_raw).strip()
+
+        if not date_str or date_str == 'nan' or not patient_id or patient_id == 'nan':
+            continue
+
+        # PD Stage
+        if pd.isna(pd_stage_raw) or str(pd_stage_raw).strip() == '':
+            pd_stage = 0
+        else:
+            try:
+                pd_stage = int(float(pd_stage_raw))
+            except ValueError:
+                pd_stage = 0
+
+        # Medication
+        on_medication = False
+        if not pd.isna(medicine_raw):
+            val = str(medicine_raw).strip()
+            if val == '1' or val == '1.0' or val.lower() == 'true':
+                on_medication = True
+
+        # 尋找 .pt 檔案
+        left_pt = find_pt_file_2020(pt_base_dirs, date_str, patient_id, 'L')
+        right_pt = find_pt_file_2020(pt_base_dirs, date_str, patient_id, 'R')
+
+        if not left_pt or not right_pt:
+            skipped_count += 1
+            continue
+
+        try:
+            patient = PDPatient.from_pt(patient_id, pd_stage, date_str, on_medication, left_pt, right_pt)
+            patients.append(patient)
+            loaded_count += 1
+        except Exception as e:
+            print(f"Error loading 2020 data for Patient {patient_id} ({date_str}): {e}")
+
+    print(f"2020 dataset: 成功載入 {loaded_count} 位病人, 跳過 {skipped_count} 位 (缺少 .pt)")
+    return patients
+
+
 # ---------- 工具函式 ----------
 def _find_peaks_valleys(x, w=3):
     N = len(x); P=[]; V=[]
@@ -308,6 +416,8 @@ def extract_features_from_patient(p: PDPatient) -> Tuple[np.ndarray, List[str]]:
         dist_scalar = np.median(dists)
         dist_array = np.full(len(dists), dist_scalar)
 
+        # dist_scalar = np.linalg.norm(np.mean(p9, axis=0) - np.mean(p0, axis=0))
+
         for j in range(21):
             for a, axis_name in enumerate(['x', 'y', 'z']):
                 wave = arr[:, j, a]
@@ -325,7 +435,9 @@ def extract_features_from_patient(p: PDPatient) -> Tuple[np.ndarray, List[str]]:
                     detrend_order=10,
                     dist=dist_array
                 )
-                
+                # 0-9 none median, 0-9 detrend median 左有料, 
+                # 無 detrend 無 median ,0-9 detrend 全xgb 有料
+                # 0-4 detrend 全 l1 右, 0-4 detrend median 有
                 method_keys = ['cycle_amp', 'rolling_p2p', 'rms', 'hilbert']
                 stat_keys   = ['mean', 'median', 'std']
                 
@@ -339,54 +451,92 @@ def extract_features_from_patient(p: PDPatient) -> Tuple[np.ndarray, List[str]]:
 
 def main():
     parser = argparse.ArgumentParser(description="從骨架 .pt 檔案與 CSV 抽取時間序列特徵 (Clarity)")
-    parser.add_argument('--csv', type=str, required=True, help="病人 metadata CSV 檔案路徑")
-    parser.add_argument('--pt_dir', type=str, required=True, help="儲存 .pt 的基礎資料夾,可使用逗號分隔多個路徑 (例如: dir1,dir2)")
+    parser.add_argument('--csv', type=str, required=True, help="Horizontal 病人 metadata CSV 檔案路徑")
+    parser.add_argument('--pt_dir', type=str, required=True, help="Horizontal .pt 的基礎資料夾 (可逗號分隔多個路徑)")
+    parser.add_argument('--csv_2020', type=str, default=None,
+                        help="2020 資料集 CSV 檔案路徑 (PD_all_feature_header_corrected)")
+    parser.add_argument('--pt_dir_2020', type=str, default=None,
+                        help="2020 資料集 .pt 的基礎資料夾 (含 stage_X 子資料夾)")
     parser.add_argument('--output', type=str, default='extracted_features.csv', help="輸出的特徵 CSV 名稱")
     
     args = parser.parse_args()
     
+    all_features = []
+    feature_names = None
+
+    # ===== 載入 Horizontal 資料集 =====
     pt_base_dirs = [d.strip() for d in args.pt_dir.split(',')]
     
-    # User specifically requested reading from this folder
     hardcoded_dir = "./hand_view_classifer/skeleton_sequences/skeleton_sequences_4_to_8/horizontal_view"
     if hardcoded_dir not in pt_base_dirs:
         pt_base_dirs.append(hardcoded_dir)
     
-    print(f"Loading patient data from {args.csv}")
-    print(f"Searching for .pt files in {pt_base_dirs}...")
+    print(f"\n{'='*60}")
+    print(f"[Horizontal] Loading from {args.csv}")
+    print(f"[Horizontal] .pt dirs: {pt_base_dirs}")
+    print(f"{'='*60}")
     
-    patients = load_patients_from_csv(args.csv, pt_base_dirs)
-    print(f"Successfully loaded {len(patients)} patients with skeleton data.")
+    patients_horiz = load_patients_from_csv(args.csv, pt_base_dirs)
+    print(f"[Horizontal] 成功載入 {len(patients_horiz)} 位病人")
     
-    if len(patients) == 0:
-        print("No patient data found. Exiting.")
-        return
-        
-    print("Extracting features using autocorrelation...")
-    all_features = []
-    feature_names = None
-    
-    for p in patients:
+    for p in patients_horiz:
         feats, names = extract_features_from_patient(p)
-        print(f"Extracted features for patient {p.patient_id}")
         if feature_names is None:
             feature_names = names
-            
         row_data = {
             'patient_id': p.patient_id,
             'pd_stage': p.pd_stage,
             'on_medication': p.on_medication,
-            'dataset_source': 'horizontal'  # Default for this pipeline
+            'dataset_source': 'horizontal'
         }
-        
         for name, val in zip(names, feats):
             row_data[name] = val
-            
         all_features.append(row_data)
+    
+    # ===== 載入 2020 資料集 (選用) =====
+    if args.csv_2020 and args.pt_dir_2020:
+        pt_2020_dirs = [d.strip() for d in args.pt_dir_2020.split(',')]
         
+        print(f"\n{'='*60}")
+        print(f"[2020/Old] Loading from {args.csv_2020}")
+        print(f"[2020/Old] .pt dirs: {pt_2020_dirs}")
+        print(f"{'='*60}")
+        
+        patients_2020 = load_patients_from_2020_csv(args.csv_2020, pt_2020_dirs)
+        print(f"[2020/Old] 成功載入 {len(patients_2020)} 位病人")
+        
+        for p in patients_2020:
+            feats, names = extract_features_from_patient(p)
+            if feature_names is None:
+                feature_names = names
+            row_data = {
+                'patient_id': p.patient_id,
+                'pd_stage': p.pd_stage,
+                'on_medication': p.on_medication,
+                'dataset_source': 'old'
+            }
+            for name, val in zip(names, feats):
+                row_data[name] = val
+            all_features.append(row_data)
+    
+    # ===== 輸出 =====
+    if len(all_features) == 0:
+        print("No patient data found. Exiting.")
+        return
+
     df_features = pd.DataFrame(all_features)
     df_features.to_csv(args.output, index=False)
-    print(f"Feature extraction complete! Saved {df_features.shape[0]} rows and {df_features.shape[1]} columns to {args.output}")
+    
+    # 統計摘要
+    print(f"\n{'='*60}")
+    print(f"Feature extraction complete!")
+    print(f"  Total rows: {df_features.shape[0]}")
+    print(f"  Total columns: {df_features.shape[1]}")
+    if 'dataset_source' in df_features.columns:
+        for src, cnt in df_features['dataset_source'].value_counts().items():
+            print(f"  - {src}: {cnt} rows")
+    print(f"  Output: {args.output}")
+    print(f"{'='*60}")
 
 if __name__ == '__main__':
     main()
