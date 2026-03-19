@@ -197,11 +197,18 @@ def plot_and_report(results_dict, dataset_name, args, joint_label):
         axes_cm[i].set_ylabel('True')
         axes_cm[i].set_xticklabels(['Healthy', 'PD'])
         axes_cm[i].set_yticklabels(['Healthy', 'PD'])
+    
+    if dataset_name == "horizontal":
+        year = "2025"
+    elif dataset_name == "old":
+        year = "2020"
+    else:
+        year = dataset_name
 
     # ROC 設定
     ax_roc.plot([0, 1], [0, 1], 'k--')
     title_suffix = "(Youden's J)" if args.use_youden else "(Thresh=0.5)"
-    ax_roc.set_title(f'{dataset_name} - {joint_label} LOOCV ROC {title_suffix}',
+    ax_roc.set_title(f'{year} - {joint_label} LOOCV ROC {title_suffix}',
                      fontsize=14, fontweight='bold')
     ax_roc.set_xlabel('False Positive Rate')
     ax_roc.set_ylabel('True Positive Rate')
@@ -210,7 +217,7 @@ def plot_and_report(results_dict, dataset_name, args, joint_label):
     ax_roc.set_aspect('equal')
 
     safe_label = joint_label.replace(' ', '_').replace(',', '-')
-    fig_suffix = f"{safe_label}_{dataset_name}"
+    fig_suffix = f"{safe_label}_{year}"
     fig_roc.savefig(os.path.join(args.save_dir, f'roc_{fig_suffix}.png'), bbox_inches='tight')
     fig_cm.savefig(os.path.join(args.save_dir, f'cm_{fig_suffix}.png'), bbox_inches='tight')
 
@@ -220,7 +227,7 @@ def plot_and_report(results_dict, dataset_name, args, joint_label):
 
     df_res = pd.DataFrame(table_results)
     cols_order = ['Model', 'Threshold', 'AUROC', 'Acc', 'Precision', 'Recall', 'F1-score']
-    print(f"\n=== Performance Report: {dataset_name} | {joint_label} LOOCV ===")
+    print(f"\n=== Performance Report: {year} | {joint_label} LOOCV ===")
     print(df_res[cols_order].round(4).to_string(index=False))
 
     df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
@@ -244,6 +251,8 @@ def main():
                         help="Filter by dataset source")
     parser.add_argument('--save_dir', type=str, default='xgb_exp/results',
                         help="Directory to save plots and metrics")
+    parser.add_argument('--cross_dataset', action='store_true',
+                        help="Train on 2020 (old) and test on 2025 (horizontal). Ignores --dataset_source if set.")
     parser.add_argument('--no_show', action='store_true',
                         help="Do not display plots (useful for headless environments)")
     args = parser.parse_args()
@@ -267,51 +276,117 @@ def main():
     if df_full.empty:
         return
 
-    if args.dataset_source == 'all':
-        target_datasets = df_full['dataset_source'].dropna().unique()
-    else:
-        target_datasets = [args.dataset_source]
+    metadata_cols = ['patient_id', 'date', 'pd_stage', 'on_medication', 'dataset_source']
 
-    metadata_cols = ['patient_id', 'pd_stage', 'on_medication', 'dataset_source']
-
-    for source_name in target_datasets:
-        mask_source = df_full['dataset_source'].astype(str).str.contains(
-            source_name, case=False, na=False)
-        if not mask_source.any():
-            continue
-
+    if args.cross_dataset:
         print(f"\n{'='*70}")
-        print(f"正在處理資料集: {source_name}")
+        print(f"模式: Cross-Dataset (Train on 'old', Test on 'horizontal')")
         print(f"{'='*70}")
-
+        
         mask_med = (df_full['on_medication'] == 0) | (df_full['on_medication'] == False)
-        df_subset = df_full[mask_source & mask_med].copy()
-
-        print(f"符合條件的樣本數 (No Med): {len(df_subset)}")
-        if len(df_subset) < 5:
-            print("樣本數不足 (< 5)，跳過。")
-            continue
-
-        y_binary = pd.Series((df_subset['pd_stage'] > 0).astype(int).values)
-
-        X_all = df_subset.drop(columns=[c for c in metadata_cols if c in df_subset.columns])
-        X_all = X_all.select_dtypes(include=[np.number]).reset_index(drop=True)
-
+        
+        # 分割 Train (old) / Test (horizontal)
+        df_train = df_full[(df_full['dataset_source'] == 'old') & mask_med].copy()
+        df_test = df_full[(df_full['dataset_source'] == 'horizontal') & mask_med].copy()
+        
+        # 移除重複 (已經在 extract_features 處理過，但多一道保險)
+        if 'date' in df_train.columns:
+            df_train = df_train.drop_duplicates(subset=['patient_id', 'date'], keep='first')
+        if 'date' in df_test.columns:
+            df_test = df_test.drop_duplicates(subset=['patient_id', 'date'], keep='first')
+            
+        print(f"訓練集 (old) 樣本數 (No Med): {len(df_train)}")
+        print(f"測試集 (horizontal) 樣本數 (No Med): {len(df_test)}")
+        
+        if len(df_train) == 0 or len(df_test) == 0:
+            print("訓練集或測試集樣本數為 0，無法執行。")
+            return
+            
+        y_train = pd.Series((df_train['pd_stage'] > 0).astype(int).values)
+        y_test_binary = pd.Series((df_test['pd_stage'] > 0).astype(int).values)
+        
+        X_train_all = df_train.drop(columns=[c for c in metadata_cols if c in df_train.columns])
+        X_train_all = X_train_all.select_dtypes(include=[np.number]).reset_index(drop=True)
+        
+        X_test_all = df_test.drop(columns=[c for c in metadata_cols if c in df_test.columns])
+        X_test_all = X_test_all.select_dtypes(include=[np.number]).reset_index(drop=True)
+        
         # 篩選指定關節特徵
-        selected_cols = filter_joint_columns(X_all.columns, joint_indices)
+        selected_cols = filter_joint_columns(X_train_all.columns, joint_indices)
         if len(selected_cols) == 0:
-            print(f"警告：資料集 {source_name} 找不到指定關節的欄位，已跳過。")
-            continue
-
-        X_selected = X_all[selected_cols]
+            print("找不到指定關節的欄位。")
+            return
+            
+        X_train_sel = X_train_all[selected_cols]
+        X_test_sel = X_test_all[selected_cols]
         print(f"篩選出 {len(selected_cols)} 個特徵 ({joint_label})")
+        
+        scale_pos_weight = np.sum(y_train == 0) / np.sum(y_train == 1) if np.sum(y_train == 1) > 0 else 1.0
+        classifiers = get_classifiers(scale_pos_weight)
+        
+        # 中位數填補 + 標準化 (以 train_set fit)
+        train_medians = X_train_sel.median(numeric_only=True)
+        X_train_filled = X_train_sel.fillna(train_medians)
+        X_test_filled = X_test_sel.fillna(train_medians)
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train_filled)
+        X_test_scaled = scaler.transform(X_test_filled)
+        
+        aggregated = {name: {'y_true': y_test_binary.tolist(), 'y_prob': []} for name, _ in classifiers}
+        
+        for name, clf in classifiers:
+            clf.fit(X_train_scaled, y_train.values)
+            prob = clf.predict_proba(X_test_scaled)[:, 1]
+            aggregated[name]['y_prob'] = prob.tolist()
+            
+        global_year_override = "CrossDataset_Old2Horiz"
+        plot_and_report(aggregated, global_year_override, args, joint_label)
 
-        # 印出特徵欄位摘要
-        left_count = sum(1 for c in selected_cols if c.startswith('L_'))
-        right_count = sum(1 for c in selected_cols if c.startswith('R_'))
-        print(f"  左手: {left_count} 個, 右手: {right_count} 個")
+    else:
+        if args.dataset_source == 'all':
+            target_datasets = df_full['dataset_source'].dropna().unique()
+        else:
+            target_datasets = [args.dataset_source]
 
-        run_joint_loocv(X_selected, y_binary, args, source_name, joint_label)
+        for source_name in target_datasets:
+            mask_source = df_full['dataset_source'].astype(str).str.contains(
+                source_name, case=False, na=False)
+            if not mask_source.any():
+                continue
+
+            print(f"\n{'='*70}")
+            print(f"正在處理資料集: {source_name}")
+            print(f"{'='*70}")
+
+            mask_med = (df_full['on_medication'] == 0) | (df_full['on_medication'] == False)
+            df_subset = df_full[mask_source & mask_med].copy()
+
+            print(f"符合條件的樣本數 (No Med): {len(df_subset)}")
+            if len(df_subset) < 5:
+                print("樣本數不足 (< 5)，跳過。")
+                continue
+
+            y_binary = pd.Series((df_subset['pd_stage'] > 0).astype(int).values)
+
+            X_all = df_subset.drop(columns=[c for c in metadata_cols if c in df_subset.columns])
+            X_all = X_all.select_dtypes(include=[np.number]).reset_index(drop=True)
+
+            # 篩選指定關節特徵
+            selected_cols = filter_joint_columns(X_all.columns, joint_indices)
+            if len(selected_cols) == 0:
+                print(f"警告：資料集 {source_name} 找不到指定關節的欄位，已跳過。")
+                continue
+
+            X_selected = X_all[selected_cols]
+            print(f"篩選出 {len(selected_cols)} 個特徵 ({joint_label})")
+
+            # 印出特徵欄位摘要
+            left_count = sum(1 for c in selected_cols if c.startswith('L_'))
+            right_count = sum(1 for c in selected_cols if c.startswith('R_'))
+            print(f"  左手: {left_count} 個, 右手: {right_count} 個")
+
+            run_joint_loocv(X_selected, y_binary, args, source_name, joint_label)
 
 
 if __name__ == '__main__':

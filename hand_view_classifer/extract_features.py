@@ -95,6 +95,7 @@ def load_patients_from_csv(csv_path: str, pt_base_dirs: List[str]) -> List[PDPat
         if col not in df.columns:
             print(f"Warning: Column '{col}' not found in CSV. Missing values will be assigned.")
             df[col] = np.nan
+    seen_patients = set()
 
     for index, row in df.iterrows():
         date_str = str(row.get('日期', '')).strip().replace('.0', '').replace('/', '')
@@ -104,6 +105,10 @@ def load_patients_from_csv(csv_path: str, pt_base_dirs: List[str]) -> List[PDPat
 
         if not date_str or date_str == 'nan' or not patient_id or patient_id == 'nan':
             continue
+
+        if (date_str, patient_id) in seen_patients:
+            continue
+        seen_patients.add((date_str, patient_id))
 
         if pd.isna(pd_stage_raw) or str(pd_stage_raw).strip() == '' or str(pd_stage_raw) == '-':
             pd_stage = 0
@@ -198,6 +203,7 @@ def load_patients_from_2020_csv(csv_path: str, pt_base_dirs: List[str]) -> List[
 
     loaded_count = 0
     skipped_count = 0
+    seen_patients = set()
 
     for index, row in df.iterrows():
         date_raw = row.get('Date')
@@ -213,6 +219,10 @@ def load_patients_from_2020_csv(csv_path: str, pt_base_dirs: List[str]) -> List[
 
         if not date_str or date_str == 'nan' or not patient_id or patient_id == 'nan':
             continue
+
+        if (date_str, patient_id) in seen_patients:
+            continue
+        seen_patients.add((date_str, patient_id))
 
         # PD Stage
         if pd.isna(pd_stage_raw) or str(pd_stage_raw).strip() == '':
@@ -485,6 +495,7 @@ def main():
             feature_names = names
         row_data = {
             'patient_id': p.patient_id,
+            'date': p.date,
             'pd_stage': p.pd_stage,
             'on_medication': p.on_medication,
             'dataset_source': 'horizontal'
@@ -511,6 +522,7 @@ def main():
                 feature_names = names
             row_data = {
                 'patient_id': p.patient_id,
+                'date': p.date,
                 'pd_stage': p.pd_stage,
                 'on_medication': p.on_medication,
                 'dataset_source': 'old'

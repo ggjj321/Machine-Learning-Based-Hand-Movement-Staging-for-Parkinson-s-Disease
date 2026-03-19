@@ -456,7 +456,7 @@ def main():
     else:
         target_datasets = [args.dataset_source]
 
-    metadata_cols = ['patient_id', 'pd_stage', 'on_medication', 'dataset_source']
+    metadata_cols = ['patient_id', 'date', 'pd_stage', 'on_medication', 'dataset_source']
 
     # 定義使用的特徵選擇方法
     fs_methods = [
@@ -475,6 +475,14 @@ def main():
 
         mask_med = (df_full['on_medication'] == 0) | (df_full['on_medication'] == False)
         df_subset = df_full[mask_source & mask_med].copy()
+
+        # 移除重複病人 (同 patient_id + 同 date)
+        if 'date' in df_subset.columns:
+            before = len(df_subset)
+            df_subset = df_subset.drop_duplicates(subset=['patient_id', 'date'], keep='first')
+            n_dropped = before - len(df_subset)
+            if n_dropped > 0:
+                print(f"移除 {n_dropped} 筆重複資料 (同 patient_id + 同 date)")
 
         print(f"符合條件的樣本數 (No Med): {len(df_subset)}")
         if len(df_subset) < 5:
