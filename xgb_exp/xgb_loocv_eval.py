@@ -133,10 +133,14 @@ def train_and_predict_lda_xgb(X_train, y_train_bin, y_train_mul, X_test):
 # ==========================================
 # 4. 評估流程：一般 LOOCV (所有特徵混合)
 # ==========================================
-def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods):
-    print(f"\n--- 開始執行 Standard LOOCV (不分左右手，總樣本數: {len(y_binary)}) ---")
+def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods, hand_label="Both"):
+    exp_name = "Standard_LOOCV" if hand_label == "Both" else f"Standard_{hand_label}_Hand_LOOCV"
+    print(f"\n--- 開始執行 {exp_name} (總樣本數: {len(y_binary)}) ---")
     
-    all_method_names = [m[0] for m in fs_methods] + ["LDA (Multi) + XGB"]
+    all_method_names = [m[0] for m in fs_methods]
+    if getattr(args, 'use_lda', False):
+        all_method_names.append("LDA (Multi) + XGB")
+        
     aggregated_results = {name: {'y_true': [], 'y_prob': []} for name in all_method_names} 
     feature_counters = {name: Counter() for name in [m[0] for m in fs_methods]}
     
@@ -160,17 +164,23 @@ def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods):
                 aggregated_results[name]['y_prob'].append(0.5)
 
         # 2. 執行 LDA 方法
-        lda_name = "LDA (Multi) + XGB"
-        try:
-            prob = train_and_predict_lda_xgb(X_train, y_train_bin, y_train_mul, X_test)
-            aggregated_results[lda_name]['y_true'].append(y_test_val)
-            aggregated_results[lda_name]['y_prob'].append(prob)
-        except Exception as e:
-            aggregated_results[lda_name]['y_true'].append(y_test_val)
-            aggregated_results[lda_name]['y_prob'].append(0.5)
+        if getattr(args, 'use_lda', False):
+            lda_name = "LDA (Multi) + XGB"
+            try:
+                prob = train_and_predict_lda_xgb(X_train, y_train_bin, y_train_mul, X_test)
+                aggregated_results[lda_name]['y_true'].append(y_test_val)
+                aggregated_results[lda_name]['y_prob'].append(prob)
+            except Exception as e:
+                aggregated_results[lda_name]['y_true'].append(y_test_val)
+                aggregated_results[lda_name]['y_prob'].append(0.5)
             
     # 繪製圖表與產生報表
-    plot_and_report_results(aggregated_results, "Standard LOOCV", dataset_name, args)
+    plot_and_report_results(aggregated_results, exp_name, dataset_name, args)
+    
+    # 新增 Top 2 特徵散佈圖 (只有當包含雙手或 Both 時才繪製)
+    if hand_label == "Both":
+        X_dict = {name: X for name in feature_counters.keys()}
+        plot_scatter_top2(feature_counters, X_dict, y_binary, exp_name, dataset_name, args)
     
     # 顯示特徵頻率
     print_top_features(feature_counters, args.k_features, len(y_binary))
@@ -233,7 +243,11 @@ def run_stacked_loocv(X_left, X_right, y_binary, args, dataset_name, fs_methods)
         # 繪圖及報表產出
         plot_and_report_results(models_to_eval, f"Stacked_{fs_name}", dataset_name, args, grid_layout=True)
 
-        print_top_features({f"{fs_name} Left": left_feature_counter, f"{fs_name} Right": right_feature_counter}, args.k_features, len(y_binary))
+        counters_to_print = {f"{fs_name} Left": left_feature_counter, f"{fs_name} Right": right_feature_counter}
+        X_dict = {f"{fs_name} Left": X_left, f"{fs_name} Right": X_right}
+        plot_scatter_top2(counters_to_print, X_dict, y_binary, f"Stacked_{fs_name}", dataset_name, args)
+
+        print_top_features(counters_to_print, args.k_features, len(y_binary))
 
 
 # ==========================================
@@ -323,11 +337,178 @@ def run_asymmetric_stacked_loocv(X_left, X_right, y_binary, args, dataset_name, 
 
         plot_and_report_results(models_to_eval, f"Asymmetric_{fs_name}", dataset_name, args, grid_layout=True)
 
-        print_top_features({
+        counters_to_print = {
             f"{fs_name} Left": left_feature_counter,
             f"{fs_name} Right": right_feature_counter,
             f"{fs_name} Diff": diff_feature_counter,
-        }, args.k_features, len(y_binary))
+        }
+        X_dict = {
+            f"{fs_name} Left": X_left,
+            f"{fs_name} Right": X_right,
+            f"{fs_name} Diff": diff_data,
+        }
+        plot_scatter_top2(counters_to_print, X_dict, y_binary, f"Asymmetric_{fs_name}", dataset_name, args)
+
+        print_top_features(counters_to_print, args.k_features, len(y_binary))
+
+# ==========================================
+# 5c. 評估流程：Cross-Dataset Evaluation (Old -> Horizontal)
+# ==========================================
+def run_standard_cross_dataset(X_train, y_train_bin, y_train_mul, X_test, y_test_bin, args, dataset_name, fs_methods, hand_label="Both"):
+    exp_name = "CrossDataset_Standard" if hand_label == "Both" else f"CrossDataset_Standard_{hand_label}_Hand"
+    print(f"\n--- 開始執行 {exp_name} (Train: {len(y_train_bin)}, Test: {len(y_test_bin)}) ---")
+    
+    all_method_names = [m[0] for m in fs_methods]
+    if getattr(args, 'use_lda', False):
+        all_method_names.append("LDA (Multi) + XGB")
+        
+    aggregated_results = {name: {'y_true': y_test_bin.tolist(), 'y_prob': []} for name in all_method_names} 
+    feature_counters = {name: Counter() for name in [m[0] for m in fs_methods]}
+    
+    for name, fs_func in fs_methods:
+        try:
+            top_cols = fs_func(X_train, y_train_bin, k=args.k_features)
+            if top_cols:
+                feature_counters[name].update(top_cols)
+                scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
+                clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
+                                    eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                clf.fit(X_train[top_cols], y_train_bin)
+                prob = clf.predict_proba(X_test[top_cols])[:, 1]
+            else:
+                prob = np.full(len(X_test), 0.5)
+            aggregated_results[name]['y_prob'] = prob.tolist()
+        except:
+            aggregated_results[name]['y_prob'] = np.full(len(X_test), 0.5).tolist()
+
+    if getattr(args, 'use_lda', False):
+        lda_name = "LDA (Multi) + XGB"
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+            train_medians = X_train.median(numeric_only=True)
+            X_train_filled = X_train.fillna(train_medians)
+            X_test_filled = X_test.fillna(train_medians)
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_filled)
+            X_test_scaled = scaler.transform(X_test_filled)
+            
+            lda = LinearDiscriminantAnalysis()
+            lda.fit(X_train_scaled, y_train_mul)
+            X_train_lda = lda.transform(X_train_scaled)
+            X_test_lda = lda.transform(X_test_scaled)
+            
+            scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
+            clf_lda = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
+                                    eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+            clf_lda.fit(X_train_lda, y_train_bin)
+            prob = clf_lda.predict_proba(X_test_lda)[:, 1]
+            aggregated_results[lda_name]['y_prob'] = prob.tolist()
+        except Exception as e:
+            aggregated_results[lda_name]['y_prob'] = np.full(len(X_test), 0.5).tolist()
+        
+    plot_and_report_results(aggregated_results, exp_name, dataset_name, args)
+    
+    if hand_label == "Both":
+        X_dict = {name: X_train for name in feature_counters.keys()}
+        plot_scatter_top2(feature_counters, X_dict, y_train_bin, exp_name, dataset_name, args)
+        
+    print_top_features(feature_counters, args.k_features, 1)
+
+def run_stacked_cross_dataset(X_l_train, X_r_train, y_train_bin, X_l_test, X_r_test, y_test_bin, args, dataset_name, fs_methods):
+    print(f"\n--- 開始執行 Stacked Cross-Dataset ---")
+    
+    for fs_name, fs_func in fs_methods:
+        left_feature_counter = Counter()
+        right_feature_counter = Counter()
+        
+        top_cols_l = fs_func(X_l_train, y_train_bin, k=args.k_features)
+        if top_cols_l: left_feature_counter.update(top_cols_l)
+        scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
+        
+        if top_cols_l:
+            clf_l = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+            clf_l.fit(X_l_train[top_cols_l], y_train_bin)
+            prob_left_train = clf_l.predict_proba(X_l_train[top_cols_l])[:, 1]
+            prob_left_test = clf_l.predict_proba(X_l_test[top_cols_l])[:, 1]
+        else:
+            prob_left_train, prob_left_test = np.full(len(X_l_train), 0.5), np.full(len(X_l_test), 0.5)
+
+        top_cols_r = fs_func(X_r_train, y_train_bin, k=args.k_features)
+        if top_cols_r: right_feature_counter.update(top_cols_r)
+        
+        if top_cols_r:
+            clf_r = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+            clf_r.fit(X_r_train[top_cols_r], y_train_bin)
+            prob_right_train = clf_r.predict_proba(X_r_train[top_cols_r])[:, 1]
+            prob_right_test = clf_r.predict_proba(X_r_test[top_cols_r])[:, 1]
+        else:
+            prob_right_train, prob_right_test = np.full(len(X_r_train), 0.5), np.full(len(X_r_test), 0.5)
+
+        X_meta_train = np.vstack((prob_left_train, prob_right_train)).T
+        X_meta_test = np.vstack((prob_left_test, prob_right_test)).T
+        
+        from sklearn.linear_model import LinearRegression
+        lr_model = LinearRegression()
+        lr_model.fit(X_meta_train, y_train_bin)
+        
+        prob_final_test = np.clip(lr_model.predict(X_meta_test), 0, 1)
+
+        models_to_eval = {
+            f'{fs_name} - Left Hand': {'y_true': y_test_bin, 'y_prob': prob_left_test},
+            f'{fs_name} - Right Hand': {'y_true': y_test_bin, 'y_prob': prob_right_test},
+            f'{fs_name} - Final Stack': {'y_true': y_test_bin, 'y_prob': prob_final_test}
+        }
+        
+        plot_and_report_results(models_to_eval, f"CrossDataset_Stacked_{fs_name}", dataset_name, args, grid_layout=True)
+        counters_to_print = {f"{fs_name} Left": left_feature_counter, f"{fs_name} Right": right_feature_counter}
+        X_dict = {f"{fs_name} Left": X_l_train, f"{fs_name} Right": X_r_train}
+        plot_scatter_top2(counters_to_print, X_dict, y_train_bin, f"CrossDataset_Stacked_{fs_name}", dataset_name, args)
+        print_top_features(counters_to_print, args.k_features, 1)
+
+def run_asymmetric_cross_dataset(X_l_train, X_r_train, diff_train, y_train_bin, X_l_test, X_r_test, diff_test, y_test_bin, args, dataset_name, fs_methods):
+    print(f"\n--- 開始執行 Asymmetric Stacked Cross-Dataset ---")
+    
+    for fs_name, fs_func in fs_methods:
+        left_feature_counter = Counter()
+        right_feature_counter = Counter()
+        diff_feature_counter = Counter()
+        
+        scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
+
+        def train_and_eval(X_tr, X_te, counter):
+            top_cols = fs_func(X_tr, y_train_bin, k=args.k_features)
+            if top_cols: counter.update(top_cols)
+            if top_cols:
+                clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                clf.fit(X_tr[top_cols], y_train_bin)
+                return clf.predict_proba(X_tr[top_cols])[:, 1], clf.predict_proba(X_te[top_cols])[:, 1]
+            return np.full(len(X_tr), 0.5), np.full(len(X_te), 0.5)
+
+        prob_l_tr, prob_l_te = train_and_eval(X_l_train, X_l_test, left_feature_counter)
+        prob_r_tr, prob_r_te = train_and_eval(X_r_train, X_r_test, right_feature_counter)
+        prob_d_tr, prob_d_te = train_and_eval(diff_train, diff_test, diff_feature_counter)
+
+        from sklearn.linear_model import LogisticRegression
+        X_meta_train = np.vstack((prob_l_tr, prob_r_tr, prob_d_tr)).T
+        X_meta_test = np.vstack((prob_l_te, prob_r_te, prob_d_te)).T
+        
+        meta = LogisticRegression(C=1.0, solver='lbfgs', max_iter=1000)
+        meta.fit(X_meta_train, y_train_bin)
+        prob_final_te = meta.predict_proba(X_meta_test)[:, 1]
+
+        models_to_eval = {
+            f'{fs_name} - Left Hand': {'y_true': y_test_bin, 'y_prob': prob_l_te},
+            f'{fs_name} - Right Hand': {'y_true': y_test_bin, 'y_prob': prob_r_te},
+            f'{fs_name} - Diff (L-R)': {'y_true': y_test_bin, 'y_prob': prob_d_te},
+            f'{fs_name} - Asymmetric Stack': {'y_true': y_test_bin, 'y_prob': prob_final_te},
+        }
+        
+        plot_and_report_results(models_to_eval, f"CrossDataset_Asym_{fs_name}", dataset_name, args, grid_layout=True)
+        counters_to_print = {f"{fs_name} Left": left_feature_counter, f"{fs_name} Right": right_feature_counter, f"{fs_name} Diff": diff_feature_counter}
+        X_dict = {f"{fs_name} Left": X_l_train, f"{fs_name} Right": X_r_train, f"{fs_name} Diff": diff_train}
+        plot_scatter_top2(counters_to_print, X_dict, y_train_bin, f"CrossDataset_Asym_{fs_name}", dataset_name, args)
+        print_top_features(counters_to_print, args.k_features, 1)
 
 # ==========================================
 # 6. 視覺化及輸出輔助函式
@@ -369,10 +550,6 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args, grid_lay
         if len(np.unique(y_true_all)) > 1:
             ax_roc.plot(fpr, tpr, lw=2, label=f'{name} (AUC={roc_auc:.2f})')
 
-        # 如果開啟 Youden's J 要標示最佳點
-        if args.use_youden:
-             ax_roc.scatter(thresh, tpr[np.argmin(np.abs(fpr - (1-thresh)))], marker='x', color='black') # 近似繪圖標記
-
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes_cm[i], annot_kws={"size": 14})
         axes_cm[i].set_title(f"{name}\nThresh={thresh:.3f}", fontsize=12, fontweight='bold')
         axes_cm[i].set_xlabel('Predicted')
@@ -406,6 +583,50 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args, grid_lay
     
     df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
 
+def plot_scatter_top2(feature_counters_dict, X_dict, y_binary, exp_name, dataset_name, args):
+    """
+    根據紀錄的 feature counters 繪製出每個方法 Top 2 特徵的 2D 散佈圖。
+    """
+    for name, counter in feature_counters_dict.items():
+        if name not in X_dict:
+            continue
+        X_df = X_dict[name]
+        most_common = counter.most_common(2)
+        
+        # 確保至少有兩個特徵才能畫 2D Scatter Plot
+        if len(most_common) >= 2:
+            top1_feat, top2_feat = most_common[0][0], most_common[1][0]
+            
+            # 確保欄位名稱正確存在
+            if top1_feat in X_df.columns and top2_feat in X_df.columns:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                # y_binary 通常是 pandas Series，可以對應 X_df 的行順序
+                scatter_data = pd.DataFrame({
+                    top1_feat: X_df[top1_feat].values,
+                    top2_feat: X_df[top2_feat].values,
+                    'Label': ['PD' if y == 1 else 'Healthy' for y in y_binary]
+                })
+                
+                sns.scatterplot(
+                    data=scatter_data, 
+                    x=top1_feat, 
+                    y=top2_feat, 
+                    hue='Label', 
+                    palette={'Healthy': 'blue', 'PD': 'red'}, 
+                    ax=ax
+                )
+                
+                ax.set_title(f"{name} Top 2 Features", fontsize=14, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+                safe_name = name.replace(' ', '_').replace('+', 'plus').replace('(', '').replace(')', '')
+                safe_exp = exp_name.replace(' ', '_')
+                fig_suffix = f"{safe_exp}_{safe_name}_{dataset_name}"
+                
+                fig.savefig(os.path.join(args.save_dir, f'scatter_{fig_suffix}.png'), bbox_inches='tight')
+                plt.close(fig)
+
 def print_top_features(feature_counters, k_features, total_folds):
     print("\n" + "="*50)
     print(f"=== Top {k_features} Most Frequently Selected Features ===")
@@ -433,11 +654,13 @@ def main():
     parser.add_argument('--k_features', type=int, default=10, help="Number of top features to select")
     parser.add_argument('--use_youden', action='store_true', help="Enable Youden's J Index for threshold optimization")
     parser.add_argument('--dataset_source', type=str, choices=['horizontal', 'old', 'all'], default='all', help="Filter by dataset source")
-    parser.add_argument('--mode', type=str, choices=['standard', 'stacked', 'asymmetric', 'both', 'all'], default='both', help="Which LOOCV mode to run: standard, stacked, asymmetric, both (standard+stacked), or all")
+    parser.add_argument('--mode', type=str, choices=['standard', 'stacked', 'asymmetric', 'both', 'separate_hands', 'all'], default='both', help="Which LOOCV mode to run: standard, stacked, asymmetric, both, separate_hands, or all")
     parser.add_argument('--save_dir', type=str, default='xgb_exp/results', help="Directory to save plots and metrics")
     parser.add_argument('--no_show', action='store_true', help="Do not display plots (useful for headless environments)")
     parser.add_argument('--add_diff_features', action='store_true', help="Add left-right difference features (L - R)")
     parser.add_argument('--diff_abs', action='store_true', help="Use absolute difference |L - R| instead of L - R")
+    parser.add_argument('--cross_dataset', action='store_true', help="Train on 2020 (old) and test on 2025 (horizontal). Ignores --dataset_source if set.")
+    parser.add_argument('--use_lda', action='store_true', help="Enable LDA (Multi-class) + XGB method in Standard mode")
     
     args = parser.parse_args()
     
@@ -464,6 +687,96 @@ def main():
         ("Logistic L1 + XGB", logistic_l1_fs),
         ("XGB Importance + XGB", xgboost_fs)
     ]
+
+    if args.cross_dataset:
+        print(f"\n{'='*70}")
+        print(f"模式: Cross-Dataset (Train on 'old', Test on 'horizontal')")
+        print(f"{'='*70}")
+        
+        mask_med = (df_full['on_medication'] == 0) | (df_full['on_medication'] == False)
+        
+        df_train = df_full[(df_full['dataset_source'] == 'old') & mask_med].copy()
+        df_test = df_full[(df_full['dataset_source'] == 'horizontal') & mask_med].copy()
+        
+        if 'date' in df_train.columns:
+            df_train = df_train.drop_duplicates(subset=['patient_id', 'date'], keep='first')
+        if 'date' in df_test.columns:
+            df_test = df_test.drop_duplicates(subset=['patient_id', 'date'], keep='first')
+            
+        print(f"訓練集 (old) 樣本數 (No Med): {len(df_train)}")
+        print(f"測試集 (horizontal) 樣本數 (No Med): {len(df_test)}")
+        
+        if len(df_train) < 5 or len(df_test) < 5:
+            print("訓練集或測試集樣本數不足。")
+            return
+            
+        y_train_bin = pd.Series((df_train['pd_stage'] > 0).astype(int).values)
+        y_train_mul = pd.Series(df_train['pd_stage'].fillna(0).astype(int).values)
+        y_test_bin = pd.Series((df_test['pd_stage'] > 0).astype(int).values)
+        
+        X_train_all = df_train.drop(columns=[c for c in metadata_cols if c in df_train.columns]).select_dtypes(include=[np.number]).reset_index(drop=True)
+        X_test_all = df_test.drop(columns=[c for c in metadata_cols if c in df_test.columns]).select_dtypes(include=[np.number]).reset_index(drop=True)
+        
+        if args.add_diff_features:
+            left_cols = [c for c in X_train_all.columns if str(c).startswith('L_')]
+            for l_col in left_cols:
+                r_col = 'R_' + l_col[2:]
+                if r_col in X_train_all.columns:
+                    diff_colname = 'Diff_' + l_col[2:]
+                    if args.diff_abs:
+                        X_train_all[diff_colname] = (X_train_all[l_col] - X_train_all[r_col]).abs()
+                        X_test_all[diff_colname] = (X_test_all[l_col] - X_test_all[r_col]).abs()
+                    else:
+                        X_train_all[diff_colname] = X_train_all[l_col] - X_train_all[r_col]
+                        X_test_all[diff_colname] = X_test_all[l_col] - X_test_all[r_col]
+
+        source_name = "CrossDataset_Old2Horiz"
+
+        if args.mode in ['standard', 'both']:
+            left_cols = [c for c in X_train_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_train_all.columns if str(c).startswith('R_')]
+            hand_label = "Both"
+            if len(left_cols) > 0 and len(right_cols) == 0:
+                hand_label = "Left"
+            elif len(right_cols) > 0 and len(left_cols) == 0:
+                hand_label = "Right"
+
+            run_standard_cross_dataset(X_train_all, y_train_bin, y_train_mul, X_test_all, y_test_bin, args, source_name, fs_methods, hand_label=hand_label)
+
+        if args.mode in ['separate_hands', 'all']:
+            left_cols = [c for c in X_train_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_train_all.columns if str(c).startswith('R_')]
+            if len(left_cols) > 0:
+                run_standard_cross_dataset(X_train_all[left_cols], y_train_bin, y_train_mul, X_test_all[left_cols], y_test_bin, args, source_name, fs_methods, hand_label="Left")
+            if len(right_cols) > 0:
+                run_standard_cross_dataset(X_train_all[right_cols], y_train_bin, y_train_mul, X_test_all[right_cols], y_test_bin, args, source_name, fs_methods, hand_label="Right")
+
+        if args.mode in ['stacked', 'both']:
+            left_cols = [c for c in X_train_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_train_all.columns if str(c).startswith('R_')]
+            if len(left_cols) > 0 and len(right_cols) > 0:
+                run_stacked_cross_dataset(X_train_all[left_cols], X_train_all[right_cols], y_train_bin, 
+                                          X_test_all[left_cols], X_test_all[right_cols], y_test_bin, args, source_name, fs_methods)
+
+        if args.mode in ['asymmetric', 'all']:
+            left_cols = [c for c in X_train_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_train_all.columns if str(c).startswith('R_')]
+            
+            left_suffix = {c[2:]: c for c in left_cols}
+            right_suffix = {c[2:]: c for c in right_cols}
+            common_suffixes = sorted(set(left_suffix.keys()) & set(right_suffix.keys()))
+
+            diff_train = pd.DataFrame(index=X_train_all.index)
+            diff_test = pd.DataFrame(index=X_test_all.index)
+            for suffix in common_suffixes:
+                diff_train[f'Diff_{suffix}'] = X_train_all[left_suffix[suffix]].values - X_train_all[right_suffix[suffix]].values
+                diff_test[f'Diff_{suffix}'] = X_test_all[left_suffix[suffix]].values - X_test_all[right_suffix[suffix]].values
+
+            if len(left_cols) > 0 and len(right_cols) > 0:
+                run_asymmetric_cross_dataset(X_train_all[left_cols], X_train_all[right_cols], diff_train, y_train_bin, 
+                                             X_test_all[left_cols], X_test_all[right_cols], diff_test, y_test_bin, args, source_name, fs_methods)
+        
+        return
 
     for source_name in target_datasets:
         mask_source = df_full['dataset_source'].astype(str).str.contains(source_name, case=False, na=False)
@@ -510,7 +823,23 @@ def main():
             print(f"已新增 {diff_count} 個左右手差距特徵 (Diff_)。總特徵數: {X_all.shape[1]}")
 
         if args.mode in ['standard', 'both']:
-            run_standard_loocv(X_all, y_binary, y_multi, args, source_name, fs_methods)
+            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
+            hand_label = "Both"
+            if len(left_cols) > 0 and len(right_cols) == 0:
+                hand_label = "Left"
+            elif len(right_cols) > 0 and len(left_cols) == 0:
+                hand_label = "Right"
+
+            run_standard_loocv(X_all, y_binary, y_multi, args, source_name, fs_methods, hand_label=hand_label)
+
+        if args.mode in ['separate_hands', 'all']:
+            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
+            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
+            if len(left_cols) > 0:
+                run_standard_loocv(X_all[left_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Left")
+            if len(right_cols) > 0:
+                run_standard_loocv(X_all[right_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Right")
 
         if args.mode in ['stacked', 'both']:
             left_cols = [c for c in X_all.columns if str(c).startswith('L_')]

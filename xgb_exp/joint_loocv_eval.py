@@ -123,7 +123,7 @@ def run_joint_loocv(X, y_binary, args, dataset_name, joint_label):
     classifiers = get_classifiers(scale_pos_weight)
 
     loo = LeaveOneOut()
-    aggregated = {name: {'y_true': [], 'y_prob': []} for name, _ in classifiers}
+    aggregated = {name: {'y_true': [], 'y_prob': [], 'importances': []} for name, _ in classifiers}
 
     for train_index, test_index in tqdm(loo.split(X), total=n_samples, desc=f"{joint_label} LOOCV"):
         X_train, X_test = X.iloc[train_index], X.iloc[test_index]
@@ -145,20 +145,29 @@ def run_joint_loocv(X, y_binary, args, dataset_name, joint_label):
                 clf = clone(clf_template)
                 clf.fit(X_train_scaled, y_train)
                 prob = clf.predict_proba(X_test_scaled)[:, 1][0]
+                
+                if hasattr(clf, 'feature_importances_'):
+                    imp = clf.feature_importances_
+                elif hasattr(clf, 'coef_'):
+                    imp = np.abs(clf.coef_[0])
+                else:
+                    imp = np.zeros(X_train_scaled.shape[1])
+                aggregated[name]['importances'].append(imp)
             except Exception:
                 prob = 0.5
+                aggregated[name]['importances'].append(np.zeros(X.shape[1]))
 
             aggregated[name]['y_true'].append(y_test_val)
             aggregated[name]['y_prob'].append(prob)
 
     # 繪圖及報表
-    plot_and_report(aggregated, dataset_name, args, joint_label)
+    plot_and_report(aggregated, dataset_name, args, joint_label, X, y_binary)
 
 
 # ==========================================
 # 5. 視覺化及報表輸出
 # ==========================================
-def plot_and_report(results_dict, dataset_name, args, joint_label):
+def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_binary=None):
     """ROC 曲線、混淆矩陣、指標表格"""
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -220,6 +229,39 @@ def plot_and_report(results_dict, dataset_name, args, joint_label):
     fig_suffix = f"{safe_label}_{year}"
     fig_roc.savefig(os.path.join(args.save_dir, f'roc_{fig_suffix}.png'), bbox_inches='tight')
     fig_cm.savefig(os.path.join(args.save_dir, f'cm_{fig_suffix}.png'), bbox_inches='tight')
+
+    # 畫出每個模型前兩大特徵的 2D Scatter Plot
+    if X is not None and y_binary is not None:
+        for name, data in results_dict.items():
+            if 'importances' in data and len(data['importances']) > 0:
+                avg_imp = np.mean(data['importances'], axis=0)
+                if np.sum(avg_imp) > 0:
+                    top2_idx = np.argsort(avg_imp)[-2:][::-1]
+                    top1_feat = X.columns[top2_idx[0]]
+                    top2_feat = X.columns[top2_idx[1]]
+                    
+                    fig_scatter, ax_scatter = plt.subplots(figsize=(8, 6))
+                    scatter_data = pd.DataFrame({
+                        top1_feat: X[top1_feat].values,
+                        top2_feat: X[top2_feat].values,
+                        'Label': ['PD' if y == 1 else 'Healthy' for y in y_binary]
+                    })
+                    
+                    sns.scatterplot(
+                        data=scatter_data, 
+                        x=top1_feat, 
+                        y=top2_feat, 
+                        hue='Label', 
+                        palette={'Healthy': 'blue', 'PD': 'red'},
+                        ax=ax_scatter
+                    )
+                    
+                    ax_scatter.set_title(f"{name} Top 2 Features\n({year} - {joint_label})", fontsize=14, fontweight='bold')
+                    ax_scatter.grid(True, alpha=0.3)
+                    
+                    safe_name = name.replace(' ', '_')
+                    fig_scatter.savefig(os.path.join(args.save_dir, f'scatter_{safe_name}_{fig_suffix}.png'), bbox_inches='tight')
+                    plt.close(fig_scatter)
 
     plt.tight_layout()
     if not args.no_show:
@@ -333,15 +375,22 @@ def main():
         X_train_scaled = scaler.fit_transform(X_train_filled)
         X_test_scaled = scaler.transform(X_test_filled)
         
-        aggregated = {name: {'y_true': y_test_binary.tolist(), 'y_prob': []} for name, _ in classifiers}
+        aggregated = {name: {'y_true': y_test_binary.tolist(), 'y_prob': [], 'importances': []} for name, _ in classifiers}
         
         for name, clf in classifiers:
             clf.fit(X_train_scaled, y_train.values)
             prob = clf.predict_proba(X_test_scaled)[:, 1]
             aggregated[name]['y_prob'] = prob.tolist()
+            if hasattr(clf, 'feature_importances_'):
+                imp = clf.feature_importances_
+            elif hasattr(clf, 'coef_'):
+                imp = np.abs(clf.coef_[0])
+            else:
+                imp = np.zeros(X_train_sel.shape[1])
+            aggregated[name]['importances'] = [imp]
             
         global_year_override = "CrossDataset_Old2Horiz"
-        plot_and_report(aggregated, global_year_override, args, joint_label)
+        plot_and_report(aggregated, global_year_override, args, joint_label, X_test_sel, y_test_binary)
 
     else:
         if args.dataset_source == 'all':
