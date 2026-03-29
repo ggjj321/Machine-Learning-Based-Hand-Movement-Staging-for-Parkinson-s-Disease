@@ -106,7 +106,7 @@ def get_classifiers(scale_pos_weight=1.0):
         ("XGBoost", XGBClassifier(
             n_estimators=50, max_depth=3, learning_rate=0.1,
             scale_pos_weight=scale_pos_weight,
-            eval_metric='logloss', use_label_encoder=False,
+            eval_metric='logloss',
             random_state=42, n_jobs=1)),
     ]
 
@@ -207,17 +207,18 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
         axes_cm[i].set_xticklabels(['Healthy', 'PD'])
         axes_cm[i].set_yticklabels(['Healthy', 'PD'])
     
-    if dataset_name == "horizontal":
-        year = "2025"
+    if args.cross_dataset:
+        prefix = "cross dataset"
+    elif dataset_name == "horizontal":
+        prefix = "2025"
     elif dataset_name == "old":
-        year = "2020"
+        prefix = "2020"
     else:
-        year = dataset_name
+        prefix = dataset_name
 
     # ROC 設定
     ax_roc.plot([0, 1], [0, 1], 'k--')
-    title_suffix = "(Youden's J)" if args.use_youden else "(Thresh=0.5)"
-    ax_roc.set_title(f'{year} - {joint_label} LOOCV ROC {title_suffix}',
+    ax_roc.set_title(f'{prefix} {joint_label} LOOCV ROC',
                      fontsize=14, fontweight='bold')
     ax_roc.set_xlabel('False Positive Rate')
     ax_roc.set_ylabel('True Positive Rate')
@@ -226,7 +227,7 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
     ax_roc.set_aspect('equal')
 
     safe_label = joint_label.replace(' ', '_').replace(',', '-')
-    fig_suffix = f"{safe_label}_{year}"
+    fig_suffix = f"{safe_label}_{prefix.replace(' ', '_')}"
     fig_roc.savefig(os.path.join(args.save_dir, f'roc_{fig_suffix}.png'), bbox_inches='tight')
     fig_cm.savefig(os.path.join(args.save_dir, f'cm_{fig_suffix}.png'), bbox_inches='tight')
 
@@ -256,7 +257,7 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
                         ax=ax_scatter
                     )
                     
-                    ax_scatter.set_title(f"{name} Top 2 Features\n({year} - {joint_label})", fontsize=14, fontweight='bold')
+                    ax_scatter.set_title(f"{name} Top 2 Features\n({prefix} {joint_label})", fontsize=14, fontweight='bold')
                     ax_scatter.grid(True, alpha=0.3)
                     
                     safe_name = name.replace(' ', '_')
@@ -269,7 +270,7 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
 
     df_res = pd.DataFrame(table_results)
     cols_order = ['Model', 'Threshold', 'AUROC', 'Acc', 'Precision', 'Recall', 'F1-score']
-    print(f"\n=== Performance Report: {year} | {joint_label} LOOCV ===")
+    print(f"\n=== Performance Report: {prefix} | {joint_label} LOOCV ===")
     print(df_res[cols_order].round(4).to_string(index=False))
 
     df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
@@ -302,10 +303,13 @@ def main():
     # 解析關節選擇
     if args.joints.strip().lower() == 'all':
         joint_indices = None  # None = 使用全部
-        joint_label = "All_Joints"
+        joint_label = "all joint"
     else:
         joint_indices = [int(j.strip()) for j in args.joints.split(',')]
-        joint_label = f"Joint_{args.joints.replace(',', '-')}"
+        if len(joint_indices) == 1:
+            joint_label = f"joint {joint_indices[0]}"
+        else:
+            joint_label = f"joint {args.joints.replace(',', ' ')}"
 
     # 讀取 CSV
     try:

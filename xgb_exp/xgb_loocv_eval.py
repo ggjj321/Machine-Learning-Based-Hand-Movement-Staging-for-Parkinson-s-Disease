@@ -47,7 +47,7 @@ def xgboost_fs(X_train, y_train, k=10):
     scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
     if len(np.unique(y_train)) < 2: return X_train.columns[:k].tolist()
     model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                          eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                          eval_metric='logloss', random_state=42, n_jobs=1)
     model.fit(X_num, y_train)
     imp_dict = model.get_booster().get_score(importance_type="gain")
     scores = pd.Series(imp_dict).reindex(X_train.columns).fillna(0).sort_values(ascending=False)
@@ -97,7 +97,7 @@ def train_and_predict_xgb(X_train, y_train, X_test, fs_func, k_features, feature
     scale_pos_weight = np.sum(y_train == 0) / np.sum(y_train == 1) if np.sum(y_train == 1) > 0 else 1.0
     
     clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                        eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                        eval_metric='logloss', random_state=42, n_jobs=1)
     
     clf.fit(X_train[top_cols], y_train)
     prob = clf.predict_proba(X_test[top_cols])[:, 1][0]
@@ -125,7 +125,7 @@ def train_and_predict_lda_xgb(X_train, y_train_bin, y_train_mul, X_test):
     scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
     
     clf_lda = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                            eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                            eval_metric='logloss', random_state=42, n_jobs=1)
     clf_lda.fit(X_train_lda, y_train_bin)
 
     return clf_lda.predict_proba(X_test_lda)[:, 1][0]
@@ -372,7 +372,7 @@ def run_standard_cross_dataset(X_train, y_train_bin, y_train_mul, X_test, y_test
                 feature_counters[name].update(top_cols)
                 scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
                 clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                                    eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                                    eval_metric='logloss', random_state=42, n_jobs=1)
                 clf.fit(X_train[top_cols], y_train_bin)
                 prob = clf.predict_proba(X_test[top_cols])[:, 1]
             else:
@@ -400,7 +400,7 @@ def run_standard_cross_dataset(X_train, y_train_bin, y_train_mul, X_test, y_test
             
             scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
             clf_lda = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                                    eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                                    eval_metric='logloss', random_state=42, n_jobs=1)
             clf_lda.fit(X_train_lda, y_train_bin)
             prob = clf_lda.predict_proba(X_test_lda)[:, 1]
             aggregated_results[lda_name]['y_prob'] = prob.tolist()
@@ -427,7 +427,7 @@ def run_stacked_cross_dataset(X_l_train, X_r_train, y_train_bin, X_l_test, X_r_t
         scale_pos_weight = np.sum(y_train_bin == 0) / np.sum(y_train_bin == 1) if np.sum(y_train_bin == 1) > 0 else 1.0
         
         if top_cols_l:
-            clf_l = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+            clf_l = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', random_state=42, n_jobs=1)
             clf_l.fit(X_l_train[top_cols_l], y_train_bin)
             prob_left_train = clf_l.predict_proba(X_l_train[top_cols_l])[:, 1]
             prob_left_test = clf_l.predict_proba(X_l_test[top_cols_l])[:, 1]
@@ -438,7 +438,7 @@ def run_stacked_cross_dataset(X_l_train, X_r_train, y_train_bin, X_l_test, X_r_t
         if top_cols_r: right_feature_counter.update(top_cols_r)
         
         if top_cols_r:
-            clf_r = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+            clf_r = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', random_state=42, n_jobs=1)
             clf_r.fit(X_r_train[top_cols_r], y_train_bin)
             prob_right_train = clf_r.predict_proba(X_r_train[top_cols_r])[:, 1]
             prob_right_test = clf_r.predict_proba(X_r_test[top_cols_r])[:, 1]
@@ -480,7 +480,7 @@ def run_asymmetric_cross_dataset(X_l_train, X_r_train, diff_train, y_train_bin, 
             top_cols = fs_func(X_tr, y_train_bin, k=args.k_features)
             if top_cols: counter.update(top_cols)
             if top_cols:
-                clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', use_label_encoder=False, random_state=42, n_jobs=1)
+                clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight, eval_metric='logloss', random_state=42, n_jobs=1)
                 clf.fit(X_tr[top_cols], y_train_bin)
                 return clf.predict_proba(X_tr[top_cols])[:, 1], clf.predict_proba(X_te[top_cols])[:, 1]
             return np.full(len(X_tr), 0.5), np.full(len(X_te), 0.5)
@@ -557,10 +557,24 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args, grid_lay
         axes_cm[i].set_xticklabels(['Healthy', 'PD'])
         axes_cm[i].set_yticklabels(['Healthy', 'PD'])
 
+    if getattr(args, 'cross_dataset', False):
+        prefix = "cross dataset"
+    elif dataset_name == "horizontal":
+        prefix = "2025"
+    elif dataset_name == "old":
+        prefix = "2020"
+    else:
+        prefix = dataset_name
+
     # ROC Figure 設定
     ax_roc.plot([0, 1], [0, 1], 'k--')
-    title_suffix = "(Youden's J)" if args.use_youden else "(Thresh=0.5)"
-    ax_roc.set_title(f'{dataset_name} - {exp_name} ROC Curves {title_suffix}', fontsize=14, fontweight='bold')
+    # 移除 "Standard" 標示、重複的 CrossDataset 標示並處理底線
+    exp_label = exp_name.replace('Standard_', '')
+    if prefix == "cross dataset":
+        exp_label = exp_label.replace('CrossDataset_', '').replace('CrossDataset', '')
+    exp_label = exp_label.replace('_', ' ').strip()
+    
+    ax_roc.set_title(f'{prefix} {exp_label} ROC Curves', fontsize=14, fontweight='bold')
     ax_roc.set_xlabel('False Positive Rate')
     ax_roc.set_ylabel('True Positive Rate')
     ax_roc.legend(loc="lower right")
@@ -578,7 +592,7 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args, grid_lay
 
     df_res = pd.DataFrame(table_results)
     cols_order = ['Model', 'Threshold', 'AUROC', 'Acc', 'Precision', 'Recall', 'F1-score']
-    print(f"\n=== Performance Report: {dataset_name} | {exp_name} ===")
+    print(f"\n=== Performance Report: {prefix} | {exp_label} ===")
     print(df_res[cols_order].round(4).to_string(index=False))
     
     df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
@@ -587,6 +601,21 @@ def plot_scatter_top2(feature_counters_dict, X_dict, y_binary, exp_name, dataset
     """
     根據紀錄的 feature counters 繪製出每個方法 Top 2 特徵的 2D 散佈圖。
     """
+    if getattr(args, 'cross_dataset', False):
+        prefix = "cross dataset"
+    elif dataset_name == "horizontal":
+        prefix = "2025"
+    elif dataset_name == "old":
+        prefix = "2020"
+    else:
+        prefix = dataset_name
+        
+    # 移除 "Standard" 標示、重複的 CrossDataset 標示並處理底線
+    exp_label = exp_name.replace('Standard_', '')
+    if prefix == "cross dataset":
+        exp_label = exp_label.replace('CrossDataset_', '').replace('CrossDataset', '')
+    exp_label = exp_label.replace('_', ' ').replace('-', ' ').strip()
+
     for name, counter in feature_counters_dict.items():
         if name not in X_dict:
             continue
@@ -617,7 +646,7 @@ def plot_scatter_top2(feature_counters_dict, X_dict, y_binary, exp_name, dataset
                     ax=ax
                 )
                 
-                ax.set_title(f"{name} Top 2 Features", fontsize=14, fontweight='bold')
+                ax.set_title(f"{name} Top 2 Features\n{prefix} {exp_label}", fontsize=14, fontweight='bold')
                 ax.grid(True, alpha=0.3)
                 
                 safe_name = name.replace(' ', '_').replace('+', 'plus').replace('(', '').replace(')', '')
@@ -683,8 +712,8 @@ def main():
 
     # 定義使用的特徵選擇方法
     fs_methods = [
-        ("SelectKBest + XGB", selectkbest_fs),
-        ("Logistic L1 + XGB", logistic_l1_fs),
+        ("ANOVA + XGB", selectkbest_fs),
+        ("L1-Regularization + XGB", logistic_l1_fs),
         ("XGB Importance + XGB", xgboost_fs)
     ]
 

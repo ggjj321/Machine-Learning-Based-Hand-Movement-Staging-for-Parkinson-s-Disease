@@ -9,7 +9,6 @@ import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset
-from sklearn.preprocessing import StandardScaler
 
 
 class FeatureDataset(Dataset):
@@ -27,6 +26,7 @@ class FeatureDataset(Dataset):
                  csv_path='/Users/wukeyang/mirlab_project/acgn_exp/pd_features_with_medication(1).csv',
                  dataset_source='horizontal',
                  medication_filter='no_medication',
+                 scale_features=True,
                  scaler=None):
         
         self.csv_path = csv_path
@@ -39,7 +39,7 @@ class FeatureDataset(Dataset):
         
         # Extract features and labels
         self.feature_columns = [col for col in self.df.columns 
-                               if col not in ['patient_id', 'pd_stage', 'on_medication', 'dataset_source']]
+                               if col not in ['patient_id', 'date', 'pd_stage', 'on_medication', 'dataset_source']]
         
         self.features = self.df[self.feature_columns].values.astype(np.float32)
         
@@ -49,13 +49,17 @@ class FeatureDataset(Dataset):
         # Handle NaN and Inf values
         self.features = np.nan_to_num(self.features, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Standardize features
-        if scaler is None:
-            self.scaler = StandardScaler()
-            self.features = self.scaler.fit_transform(self.features)
-        else:
-            self.scaler = scaler
-            self.features = self.scaler.transform(self.features)
+        # Standardize features when requested. CV code can disable this and
+        # fit the scaler on each training fold to avoid leakage.
+        self.scaler = scaler
+        if scale_features:
+            from sklearn.preprocessing import StandardScaler
+
+            if scaler is None:
+                self.scaler = StandardScaler()
+                self.features = self.scaler.fit_transform(self.features)
+            else:
+                self.features = self.scaler.transform(self.features)
         
         # Convert to tensors
         self.features = torch.from_numpy(self.features)

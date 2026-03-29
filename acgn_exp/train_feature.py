@@ -1,12 +1,12 @@
 """
 Training Script for Feature-based PD Classification
 
-Train MLP or AGCN-style models using pre-computed frequency domain features
+Train AGCN-style models using pre-computed frequency domain features
 for binary classification (Healthy vs Disease).
 
 Supports:
-- Classifier type: 'linear' (default) or 'xgboost'
-- Adjacency mode: 'separate_block' (default) or 'same_block' (AGCN paper)
+- Evaluate all classifier backends: linear, xgboost, random_forest
+- Evaluate both adjacency modes: separate_block and same_block
 """
 
 import os
@@ -14,13 +14,13 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from datetime import datetime
 from sklearn.metrics import (
-    classification_report, confusion_matrix, 
+    confusion_matrix,
     roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 )
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -29,6 +29,8 @@ try:
     HAS_XGBOOST = True
 except ImportError:
     HAS_XGBOOST = False
+
+from sklearn.ensemble import RandomForestClassifier
 
 from feature_dataset import FeatureDataset, get_kfold_splits, get_loocv_splits
 from models.feature_mlp import create_feature_model
@@ -42,24 +44,17 @@ def parse_args():
     parser.add_argument('--dataset_source', type=str, default='horizontal',
                         choices=['horizontal', 'old', 'all'],
                         help='Dataset source to use')
+    parser.add_argument('--cross_dataset', action='store_true',
+                        help='Run cross-dataset evaluation (train on old, test on horizontal)')
     parser.add_argument('--medication_filter', type=str, default='no_medication',
                         choices=['no_medication', 'with_medication', 'all'],
                         help='Medication filter')
-    parser.add_argument('--model_type', type=str, default='mlp',
-                        choices=['mlp', 'agcn_style'],
-                        help='Model architecture')
-    parser.add_argument('--classifier_type', type=str, default='linear',
-                        choices=['linear', 'xgboost'],
-                        help='Classifier type for agcn_style model')
-    parser.add_argument('--adj_mode', type=str, default='separate_block',
-                        choices=['separate_block', 'same_block'],
-                        help='Adjacency matrix mode: separate_block (original) or same_block (AGCN paper)')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--n_splits', type=int, default=5, help='Number of CV folds')
-    parser.add_argument('--cv_type', type=str, default='kfold', choices=['kfold', 'loocv'],
+    parser.add_argument('--cv_type', type=str, default='loocv', choices=['kfold', 'loocv'],
                         help='Cross-validation type: kfold or loocv')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--save_dir', type=str, default='./checkpoints_feature', 
@@ -75,6 +70,30 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
+
+
+def create_scaled_tensor_dataset(base_dataset, indices, scaler=None):
+    """Create a TensorDataset with fold-specific scaling."""
+    features = base_dataset.features[indices].cpu().numpy()
+    labels = base_dataset.labels[indices].cpu()
+
+    if scaler is None:
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(features)
+    else:
+        scaled_features = scaler.transform(features)
+
+    scaled_tensor = torch.from_numpy(scaled_features.astype(np.float32))
+    return TensorDataset(scaled_tensor, labels), scaler
+
+
+def compute_class_weights(labels):
+    """Calculate inverse-frequency class weights from fold labels."""
+    labels = labels.to(torch.long)
+    class_counts = torch.bincount(labels, minlength=2).float()
+    class_counts = torch.clamp(class_counts, min=1.0)
+    weights = 1.0 / class_counts
+    return weights / weights.sum() * len(weights)
 
 
 def train_epoch(model, loader, criterion, optimizer, device):
@@ -131,7 +150,7 @@ def evaluate(model, loader, criterion, device):
     return total_loss / len(loader), correct / total, all_preds, all_targets, all_probs
 
 
-def plot_probability_distribution(all_targets, all_probs, save_dir, class_names=None):
+def plot_probability_distribution(all_targets, all_probs, save_dir, model_name, dataset_name, class_names=None):
     """Plot probability distribution for each class (healthy vs disease).
     
     Args:
@@ -195,7 +214,7 @@ def plot_probability_distribution(all_targets, all_probs, save_dir, class_names=
     # --- Plot 4: Box plot ---
     ax4 = axes[1, 1]
     box_data = [healthy_probs, disease_probs]
-    bp = ax4.boxplot(box_data, labels=class_names, patch_artist=True)
+    bp = ax4.boxplot(box_data, tick_labels=class_names, patch_artist=True)
     bp['boxes'][0].set_facecolor('lightgreen')
     bp['boxes'][1].set_facecolor('lightcoral')
     ax4.axhline(y=0.5, color='black', linestyle='--', linewidth=1.5, label='Threshold=0.5')
@@ -222,7 +241,10 @@ def plot_probability_distribution(all_targets, all_probs, save_dir, class_names=
     plt.tight_layout()
     
     # Save figure
-    save_path = os.path.join(save_dir, 'probability_distribution.png')
+    safe_model = model_name.replace(' ', '_').replace(',', '-')
+    safe_dataset = dataset_name.replace(' ', '_')
+    fig_suffix = f"{safe_model}_{safe_dataset}"
+    save_path = os.path.join(save_dir, f'prob_dist_{fig_suffix}.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved probability distribution plot to: {save_path}")
     plt.close()
@@ -236,118 +258,115 @@ def plot_probability_distribution(all_targets, all_probs, save_dir, class_names=
     print("="*60)
 
 
-def plot_evaluation_results(all_targets, all_preds, all_probs, save_dir, class_names=None):
-    """Plot ROC curve, confusion matrix and print evaluation metrics."""
+def plot_and_report_results(results_dict, exp_name, dataset_name, save_dir, class_names=None):
+    """Plot ROC curves, confusion matrices, and save metrics DataFrame."""
+    import pandas as pd
     if class_names is None:
-        class_names = ['Healthy (Stage 0)', 'Disease (Stage 1-4)']
+        class_names = ['Healthy', 'PD']
+        
+    table_results = []
+    os.makedirs(save_dir, exist_ok=True)
+    n_models = len(results_dict)
     
-    # Calculate ROC curve and AUROC first to get optimal threshold
-    fpr, tpr, thresholds = roc_curve(all_targets, all_probs)
-    auroc = auc(fpr, tpr)
+    fig_roc, ax_roc = plt.subplots(1, 1, figsize=(8, 8))
     
-    # Calculate Youden's Index to find optimal threshold
-    # Youden's J = Sensitivity + Specificity - 1 = TPR - FPR
-    youden_index = tpr - fpr
-    optimal_idx = np.argmax(youden_index)
-    optimal_threshold = thresholds[optimal_idx]
-    optimal_tpr = tpr[optimal_idx]
-    optimal_fpr = fpr[optimal_idx]
-    optimal_youden = youden_index[optimal_idx]
+    cols = min(3, n_models)
+    rows = (n_models + cols - 1) // cols
+    fig_cm, axes_cm = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows))
+    if n_models == 1: 
+        axes_cm_flat = [axes_cm]
+    else:
+        axes_cm_flat = axes_cm.flatten()
     
-    # Recalculate predictions using optimal threshold
-    all_probs_np = np.array(all_probs)
-    optimal_preds = (all_probs_np >= optimal_threshold).astype(int)
+    for i, (name, data) in enumerate(results_dict.items()):
+        y_true_all = np.array(data['y_true'])
+        y_prob_all = np.array(data['y_prob'])
+
+        # Use a fixed decision threshold so evaluation does not tune on the
+        # same validation/test predictions it reports.
+        fpr, tpr, _ = roc_curve(y_true_all, y_prob_all)
+        roc_auc = auc(fpr, tpr)
+        decision_threshold = 0.5
+
+        y_pred = (y_prob_all >= decision_threshold).astype(int)
+        acc = accuracy_score(y_true_all, y_pred)
+        prec = precision_score(y_true_all, y_pred, zero_division=0)
+        rec = recall_score(y_true_all, y_pred, zero_division=0)
+        f1 = f1_score(y_true_all, y_pred, zero_division=0)
+        cm = confusion_matrix(y_true_all, y_pred, labels=[0, 1])
+        
+        table_results.append({
+            'Model': name,
+            'Threshold': decision_threshold,
+            'AUROC': roc_auc,
+            'Acc': acc,
+            'Precision': prec,
+            'Recall': rec,
+            'F1-score': f1
+        })
+        
+        if len(np.unique(y_true_all)) > 1:
+            ax_roc.plot(fpr, tpr, lw=2, label=f'{name} (AUC={roc_auc:.2f})')
+            
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes_cm_flat[i],
+                    xticklabels=class_names, yticklabels=class_names, annot_kws={"size": 14})
+        axes_cm_flat[i].set_title(f"{name}\nThresh={decision_threshold:.3f}", fontsize=12, fontweight='bold')
+        axes_cm_flat[i].set_xlabel('Predicted')
+        axes_cm_flat[i].set_ylabel('True')
+        
+        # Plot and save probability distributions
+        plot_probability_distribution(
+            y_true_all, y_prob_all, save_dir, name, dataset_name, class_names
+        )
+        
+    for j in range(i + 1, len(axes_cm_flat)):
+        fig_cm.delaxes(axes_cm_flat[j])
+        
+    if 'cross' in dataset_name.lower():
+        prefix = "cross dataset"
+    elif dataset_name == "horizontal":
+        prefix = "2025"
+    elif dataset_name == "old":
+        prefix = "2020"
+    else:
+        prefix = dataset_name
+        
+    ax_roc.plot([0, 1], [0, 1], 'k--')
+    # 移除 redundant 'acgn' 'agcn' 'style' 等重複字眼
+    safe_exp = exp_name.replace('acgn_', '').replace('agcn_', '').replace('style', '').replace('_', ' ').replace('-', ' ').strip()
+    ax_roc.set_title(f'{prefix} {safe_exp} ROC Curves', fontsize=14, fontweight='bold')
+    ax_roc.set_xlabel('False Positive Rate')
+    ax_roc.set_ylabel('True Positive Rate')
+    ax_roc.legend(loc="lower right")
+    ax_roc.grid(True, alpha=0.3)
+    ax_roc.set_aspect('equal')
     
-    # Calculate metrics using optimal threshold predictions
-    acc = accuracy_score(all_targets, optimal_preds)
-    precision = precision_score(all_targets, optimal_preds, average='binary', zero_division=0)
-    recall = recall_score(all_targets, optimal_preds, average='binary', zero_division=0)
-    f1 = f1_score(all_targets, optimal_preds, average='binary', zero_division=0)
+    safe_exp = exp_name.replace(' ', '_')
+    safe_dataset = dataset_name.replace(' ', '_')
+    fig_suffix = f"{safe_exp}_{safe_dataset}"
     
-    # Print metrics
-    print("\n" + "="*60)
-    print("Evaluation Metrics (using Optimal Threshold):")
-    print("="*60)
-    print(f"  Optimal Threshold (Youden's Index): {optimal_threshold:.4f}")
-    print(f"  Youden's J statistic: {optimal_youden:.4f}")
-    print("-"*60)
-    print(f"  Accuracy:  {acc:.4f}")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall:    {recall:.4f}")
-    print(f"  F1-Score:  {f1:.4f}")
-    print(f"  AUROC:     {auroc:.4f}")
-    print("="*60)
+    metrics_path = os.path.join(save_dir, f'metrics_{fig_suffix}.csv')
+    roc_path = os.path.join(save_dir, f'roc_{fig_suffix}.png')
+    cm_path = os.path.join(save_dir, f'cm_{fig_suffix}.png')
     
-    # Create figure with 2 subplots
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig_roc.savefig(roc_path, bbox_inches='tight')
+    plt.close(fig_roc)
     
-    # --- Plot 1: ROC Curve ---
-    ax1 = axes[0]
-    ax1.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUROC = {auroc:.4f})')
-    ax1.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
-    ax1.fill_between(fpr, tpr, alpha=0.3, color='darkorange')
-    # Mark optimal threshold point (Youden's Index)
-    ax1.scatter([optimal_fpr], [optimal_tpr], color='red', s=100, zorder=5, 
-                label=f'Optimal (threshold={optimal_threshold:.3f})')
-    ax1.annotate(f'J={optimal_youden:.3f}', xy=(optimal_fpr, optimal_tpr), 
-                 xytext=(optimal_fpr+0.1, optimal_tpr-0.1),
-                 fontsize=10, color='red',
-                 arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
-    ax1.set_xlim([0.0, 1.0])
-    ax1.set_ylim([0.0, 1.0])
-    ax1.set_aspect('equal', adjustable='box')
-    ax1.set_xlabel('False Positive Rate', fontsize=12)
-    ax1.set_ylabel('True Positive Rate', fontsize=12)
-    ax1.set_title('Receiver Operating Characteristic (ROC) Curve', fontsize=14)
-    ax1.legend(loc='lower right', fontsize=10)
-    ax1.grid(True, alpha=0.3)
+    fig_cm.savefig(cm_path, bbox_inches='tight')
+    plt.close(fig_cm)
     
-    # --- Plot 2: Confusion Matrix (using optimal threshold) ---
-    ax2 = axes[1]
-    cm = confusion_matrix(all_targets, optimal_preds)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax2,
-                xticklabels=class_names, yticklabels=class_names,
-                annot_kws={'size': 14})
-    ax2.set_xlabel('Predicted Label', fontsize=12)
-    ax2.set_ylabel('True Label', fontsize=12)
-    ax2.set_title(f'Confusion Matrix (threshold={optimal_threshold:.3f})', fontsize=14)
+    df_res = pd.DataFrame(table_results)
+    cols_order = ['Model', 'Threshold', 'AUROC', 'Acc', 'Precision', 'Recall', 'F1-score']
     
-    # Add metrics as text box
-    metrics_text = f'Acc: {acc:.3f}\nPrec: {precision:.3f}\nRecall: {recall:.3f}\nF1: {f1:.3f}\nAUROC: {auroc:.3f}'
-    ax2.text(1.35, 0.5, metrics_text, transform=ax2.transAxes, fontsize=11,
-             verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    print("\n=== Performance Report ===")
+    print(df_res[cols_order].round(4).to_string(index=False))
+    df_res[cols_order].to_csv(metrics_path, index=False)
     
-    plt.tight_layout()
-    
-    # Save figure
-    save_path = os.path.join(save_dir, 'evaluation_results.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"\nSaved evaluation plots to: {save_path}")
-    plt.close()
-    
-    return {
-        'accuracy': acc,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'auroc': auroc,
-        'optimal_threshold': optimal_threshold,
-        'youden_j': optimal_youden
-    }
+    return table_results
 
 
 def extract_features_from_model(model, loader, device):
-    """Extract features from GCN backbone for XGBoost.
-    
-    Args:
-        model: FeatureAGCNStyle model (in eval mode, returns features)
-        loader: DataLoader
-        device: torch device
-    
-    Returns:
-        features: numpy array (N, hidden_dim)
-        labels: numpy array (N,)
-    """
+    """Extract features from GCN backbone for ML Models."""
     model.eval()
     all_features = []
     all_labels = []
@@ -355,8 +374,12 @@ def extract_features_from_model(model, loader, device):
     with torch.no_grad():
         for data, target in loader:
             data = data.to(device)
-            feats = model(data)  # In eval mode with xgboost, returns features
-            all_features.append(feats.cpu().numpy())
+            feats = model.get_graph_features(data)
+                
+            if isinstance(feats, torch.Tensor):
+                feats = feats.detach().cpu().numpy()
+                
+            all_features.append(feats)
             all_labels.append(target.numpy() if isinstance(target, torch.Tensor) else np.array([target]))
     
     return np.concatenate(all_features, axis=0), np.concatenate(all_labels, axis=0)
@@ -367,230 +390,275 @@ def main():
     set_seed(args.seed)
     
     # Validate XGBoost availability
-    if args.classifier_type == 'xgboost' and not HAS_XGBOOST:
+    if not HAS_XGBOOST:
         raise ImportError("XGBoost is required but not installed. Run: pip install xgboost")
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 
                           'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"Model type: {args.model_type}")
-    print(f"Classifier type: {args.classifier_type}")
-    print(f"Adjacency mode: {args.adj_mode}")
+    print("Model type: agcn_style")
+    print("Classifier backends: linear, xgboost, random_forest")
+    print("Adjacency modes: separate_block, same_block")
     print(f"Dataset source: {args.dataset_source}")
-    
-    # Create dataset
-    print("\nLoading dataset...")
-    dataset = FeatureDataset(
-        csv_path=args.csv_path,
-        dataset_source=args.dataset_source,
-        medication_filter=args.medication_filter
-    )
-    
-    feature_dim = dataset.get_feature_dim()
-    print(f"Feature dimension: {feature_dim}")
-    
-    # Get class weights
-    class_weights = dataset.get_class_weights().to(device)
-    print(f"Class weights: {class_weights}")
     
     # Create checkpoint directory
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # Cross-validation: collect all predictions, targets, and probabilities
-    all_preds = []
-    all_targets = []
-    all_probs = []
+    # Always run the full AGCN comparison matrix.
+    adj_modes = ['separate_block', 'same_block']
+    clf_types = ['linear', 'xgboost', 'random_forest']
+
+    aggregated_results = {
+        f"{am}_{ct}": {'y_true': [], 'y_prob': []} 
+        for am in adj_modes for ct in clf_types
+    }
     
-    # Choose CV type
-    if args.cv_type == 'loocv':
-        cv_splits = list(get_loocv_splits(dataset))
-        n_splits = len(cv_splits)
-        print(f"\nStarting LOOCV training ({n_splits} samples)...")
-    else:
-        n_splits = args.n_splits
-        cv_splits = list(get_kfold_splits(dataset, n_splits=n_splits))
-        print(f"\nStarting {n_splits}-Fold CV training...")
+    cross_dataset_saved_models = {}
     
-    for fold_idx, train_idx, val_idx in cv_splits:
-        # Create fresh model for each fold
-        model = create_feature_model(
-            input_dim=feature_dim,
-            num_classes=2,
-            model_type=args.model_type,
-            device=device,
-            adj_mode=args.adj_mode,
-            classifier_type=args.classifier_type
+    if args.cross_dataset:
+        print("\n============================================================")
+        print("Starting Cross-Dataset Evaluation (Train: old -> Test: horizontal)")
+        print("============================================================")
+        
+        train_dataset = FeatureDataset(
+            csv_path=args.csv_path,
+            dataset_source='old',
+            medication_filter=args.medication_filter,
+            scale_features=False
+        )
+        test_dataset = FeatureDataset(
+            csv_path=args.csv_path,
+            dataset_source='horizontal',
+            medication_filter=args.medication_filter,
+            scale_features=False
         )
         
-        # Loss and optimizer
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+        feature_dim = train_dataset.get_feature_dim()
+        train_tensor_dataset, scaler = create_scaled_tensor_dataset(train_dataset, list(range(len(train_dataset))))
+        test_tensor_dataset, _ = create_scaled_tensor_dataset(test_dataset, list(range(len(test_dataset))), scaler=scaler)
+        class_weights = compute_class_weights(train_tensor_dataset.tensors[1]).to(device)
+
+        train_loader = DataLoader(train_tensor_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = DataLoader(test_tensor_dataset, batch_size=args.batch_size, shuffle=False)
+        cv_splits = [(0, None, None)] # Dummy split loop for cross_dataset
+        dataset = train_dataset # For final fallback
+        full_train_dataset = train_tensor_dataset
         
-        # Data loaders
-        train_dataset = Subset(dataset, train_idx)
-        val_dataset = Subset(dataset, val_idx)
+        dataset_name_plot = 'CrossDataset_Old2Horiz'
+        cv_name = 'Cross-Dataset'
+    else:
+        print("\nLoading dataset...")
+        dataset = FeatureDataset(
+            csv_path=args.csv_path,
+            dataset_source=args.dataset_source,
+            medication_filter=args.medication_filter,
+            scale_features=False
+        )
+        feature_dim = dataset.get_feature_dim()
         
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        print(f"Feature dimension: {feature_dim}")
         
-        # Stage 1: Train GCN backbone (with linear head for gradient-based learning)
-        best_loss = float('inf')
-        patience_counter = 0
-        
-        for epoch in range(args.epochs):
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        if args.cv_type == 'loocv':
+            cv_splits = list(get_loocv_splits(dataset))
+            n_splits = len(cv_splits)
+            print(f"\nStarting LOOCV training ({n_splits} samples)...")
+            cv_name = 'LOOCV'
+        else:
+            n_splits = args.n_splits
+            cv_splits = list(get_kfold_splits(dataset, n_splits=n_splits))
+            print(f"\nStarting {n_splits}-Fold CV training...")
+            cv_name = f'{n_splits}-Fold CV'
             
-            if args.classifier_type == 'xgboost':
-                # XGBoost mode: use train_loss for early stopping
-                # (evaluate() triggers eval mode → returns features, not logits)
-                monitor_loss = train_loss
-                scheduler.step(train_loss)
-            else:
-                # Linear mode: use val_loss for early stopping
-                val_loss, val_acc, _, _, _ = evaluate(model, val_loader, criterion, device)
-                monitor_loss = val_loss
-                scheduler.step(val_loss)
-            
-            if monitor_loss < best_loss:
-                best_loss = monitor_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= args.patience:
-                    break
+        dataset_name_plot = args.dataset_source
+    
+    for fold_idx, train_idx, val_idx in cv_splits:
+        if not args.cross_dataset:
+            train_dataset_split, scaler = create_scaled_tensor_dataset(dataset, train_idx)
+            val_dataset_split, _ = create_scaled_tensor_dataset(dataset, val_idx, scaler=scaler)
+            class_weights = compute_class_weights(train_dataset_split.tensors[1]).to(device)
+
+            train_loader = DataLoader(train_dataset_split, batch_size=args.batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset_split, batch_size=args.batch_size, shuffle=False)
         
-        # Stage 2: Evaluate / XGBoost classification
-        if args.classifier_type == 'xgboost':
-            # Extract features from trained GCN backbone
+        # For each adjacency mode, train a backbone and run all classifiers
+        for am in adj_modes:
+            model = create_feature_model(
+                input_dim=feature_dim,
+                num_classes=2,
+                model_type='agcn_style',
+                device=device,
+                adj_mode=am,
+                classifier_type='linear'  # We train linear end-to-end to serve as robust feature extractor
+            )
+            
+            criterion = nn.CrossEntropyLoss(weight=class_weights)
+            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+            
+            best_loss = float('inf')
+            best_state = None
+            patience_counter = 0
+            
+            # Train Backbone
+            for epoch in range(args.epochs):
+                train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+                
+                if args.cross_dataset:
+                    # Rely on train_loss for early stopping cross_dataset to prevent leaking test set info
+                    val_loss = train_loss 
+                    scheduler.step(train_loss)
+                else:
+                    val_loss, val_acc, _, _, _ = evaluate(model, val_loader, criterion, device)
+                    scheduler.step(val_loss)
+                
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                else:
+                    patience_counter += 1
+                    if patience_counter >= args.patience:
+                        break
+            
+            # Evaluate using best model
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                
+            # 1. Linear Evaluation (uses native model predictions)
+            _, _, fold_preds_lin, fold_targets_lin, fold_probs_lin = evaluate(model, val_loader, criterion, device)
+            aggregated_results[f"{am}_linear"]['y_true'].extend(fold_targets_lin)
+            aggregated_results[f"{am}_linear"]['y_prob'].extend(fold_probs_lin)
+            
+            # 2. Extract features
             train_feats, train_labels = extract_features_from_model(model, train_loader, device)
             val_feats, val_labels = extract_features_from_model(model, val_loader, device)
             
-            # Train XGBoost on extracted features
-            xgb_model = XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                use_label_encoder=False,
-                eval_metric='logloss',
-                random_state=args.seed
-            )
-            xgb_model.fit(train_feats, train_labels)
+            # 3. XGBoost
+            xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, eval_metric='logloss', random_state=args.seed)
+            xgb.fit(train_feats, train_labels)
+            fold_probs_xgb = xgb.predict_proba(val_feats)[:, 1].tolist()
+            aggregated_results[f"{am}_xgboost"]['y_true'].extend(val_labels.tolist())
+            aggregated_results[f"{am}_xgboost"]['y_prob'].extend(fold_probs_xgb)
             
-            # Predict with XGBoost
-            fold_preds = xgb_model.predict(val_feats).tolist()
-            fold_probs = xgb_model.predict_proba(val_feats)[:, 1].tolist()
-            fold_targets = val_labels.tolist()
+            # 4. Random Forest
+            rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=args.seed)
+            rf.fit(train_feats, train_labels)
+            fold_probs_rf = rf.predict_proba(val_feats)[:, 1].tolist()
+            aggregated_results[f"{am}_random_forest"]['y_true'].extend(val_labels.tolist())
+            aggregated_results[f"{am}_random_forest"]['y_prob'].extend(fold_probs_rf)
+
+            if args.cross_dataset:
+                # Save models immediately to avoid retraining on cross-dataset evaluation later
+                cross_dataset_saved_models[am] = {
+                    'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
+                    'xgb_model': xgb,
+                    'rf_model': rf
+                }
+            
+        if not args.cross_dataset:
+            if args.cv_type == 'loocv':
+                if (fold_idx + 1) % 50 == 0 or fold_idx == n_splits - 1:
+                    print(f"Sample {fold_idx+1}/{n_splits} Evaluated.")
+            else:
+                print(f"Fold {fold_idx+1}/{n_splits} Evaluated.")
         else:
-            # Standard linear classifier evaluation
-            _, _, fold_preds, fold_targets, fold_probs = evaluate(model, val_loader, criterion, device)
-        
-        all_preds.extend(fold_preds)
-        all_targets.extend(fold_targets)
-        all_probs.extend(fold_probs)
-        
-        # Print progress (less frequent for LOOCV)
-        if args.cv_type == 'loocv':
-            if (fold_idx + 1) % 50 == 0 or fold_idx == n_splits - 1:
-                current_acc = accuracy_score(all_targets, all_preds)
-                print(f"Sample {fold_idx+1}/{n_splits} | Running Accuracy: {current_acc:.4f}")
-        else:
-            current_acc = accuracy_score(all_targets, all_preds)
-            print(f"Fold {fold_idx+1}/{n_splits} | Running Accuracy: {current_acc:.4f}")
-    
-    # Train final model on all data for cross-dataset evaluation
-    print("\n" + "-"*60)
-    print("Training final model on all data for cross-dataset evaluation...")
-    print("-"*60)
-    
-    final_model = create_feature_model(
-        input_dim=feature_dim,
-        num_classes=2,
-        model_type=args.model_type,
-        device=device,
-        adj_mode=args.adj_mode,
-        classifier_type=args.classifier_type
-    )
-    
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.AdamW(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
-    
-    full_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
-    for epoch in range(args.epochs):
-        train_loss, train_acc = train_epoch(final_model, full_loader, criterion, optimizer, device)
-        scheduler.step(train_loss)
-                
-    if args.model_type == 'agcn_style':
-        if hasattr(final_model, 'analyze_adjacency'):
-            final_model.analyze_adjacency(save_dir=args.save_dir)
-    
-    # Save the final model
-    model_save_path = os.path.join(args.save_dir, 'best_model.pt')
-    save_dict = {
-        'model_state_dict': final_model.state_dict(),
-        'model_type': args.model_type,
-        'classifier_type': args.classifier_type,
-        'adj_mode': args.adj_mode,
-        'feature_dim': feature_dim,
-        'dataset_source': args.dataset_source,
-        'medication_filter': args.medication_filter,
-        'args': vars(args)
-    }
-    
-    # If XGBoost, also train and save the final XGBoost model
-    if args.classifier_type == 'xgboost':
-        full_feats, full_labels = extract_features_from_model(final_model, full_loader, device)
-        final_xgb = XGBClassifier(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            use_label_encoder=False,
-            eval_metric='logloss',
-            random_state=args.seed
-        )
-        final_xgb.fit(full_feats, full_labels)
-        save_dict['xgb_model'] = final_xgb
-    
-    torch.save(save_dict, model_save_path)
-    print(f"Saved final model to: {model_save_path}")
-    
-    # Final evaluation with plots
-    cv_name = 'LOOCV' if args.cv_type == 'loocv' else f'{n_splits}-Fold CV'
+            print("Cross-dataset evaluation completed for both adjacency modes.")
+            
     print("\n" + "="*60)
-    print(f"{cv_name} Results ({args.model_type.upper()}):")
+    print(f"{cv_name} Results (AGCN_STYLE):")
     print("="*60)
     
-    # Plot ROC curve, confusion matrix and print metrics
-    metrics = plot_evaluation_results(
-        all_targets, all_preds, all_probs, 
-        save_dir=args.save_dir,
-        class_names=['Healthy (Stage 0)', 'Disease (Stage 1-4)']
+    # Plot Evaluation Results for all Combinations
+    table_res = plot_and_report_results(
+        aggregated_results, 
+        exp_name="acgn_agcn_style",
+        dataset_name=dataset_name_plot, 
+        save_dir=args.save_dir
     )
     
-    # Plot probability distribution
-    plot_probability_distribution(
-        all_targets, all_probs,
-        save_dir=args.save_dir,
-        class_names=['Healthy (Stage 0)', 'Disease (Stage 1-4)']
-    )
-    
-    print("\nClassification Report:")
-    print(classification_report(all_targets, all_preds, 
-                                target_names=['Healthy (Stage 0)', 'Disease (Stage 1-4)']))
-    
-    # Save predictions and metrics
-    torch.save({
-        'predictions': all_preds, 
-        'targets': all_targets,
-        'probabilities': all_probs,
-        'metrics': metrics,
-        'args': vars(args)
-    }, os.path.join(args.save_dir, f'{args.cv_type}_results.pt'))
-    print(f"\nSaved {cv_name} results to {args.save_dir}/{args.cv_type}_results.pt")
-    
+    if args.cross_dataset:
+        print("\n" + "-"*60)
+        print("Saving cross-dataset models (already trained on all source data)...")
+        print("-"*60)
+        for am in adj_modes:
+            saved = cross_dataset_saved_models[am]
+            
+            # Recreate model skeleton to easily run adjacency analysis if exists
+            final_model = create_feature_model(
+                input_dim=feature_dim, num_classes=2, model_type='agcn_style',
+                device=device, adj_mode=am, classifier_type='linear'
+            )
+            final_model.load_state_dict(saved['model_state_dict'])
+            
+            if hasattr(final_model, 'analyze_adjacency'):
+                final_model.analyze_adjacency(save_dir=args.save_dir)
+                
+            model_save_path = os.path.join(args.save_dir, f'best_model_{am}.pt')
+            save_dict = {
+                'model_state_dict': saved['model_state_dict'],
+                'model_type': 'agcn_style',
+                'adj_mode': am,
+                'feature_dim': feature_dim,
+                'dataset_source': args.dataset_source,
+                'medication_filter': args.medication_filter,
+                'xgb_model': saved['xgb_model'],
+                'rf_model': saved['rf_model'],
+                'args': vars(args)
+            }
+            torch.save(save_dict, model_save_path)
+            print(f"Saved final cross-dataset model to: {model_save_path}")
+    else:
+        # Train final models on all data for cross-validation evaluation/serving
+        print("\n" + "-"*60)
+        print("Training final backbone models on all data...")
+        print("-"*60)
+        
+        full_dataset_scaled, _ = create_scaled_tensor_dataset(dataset, list(range(len(dataset))))
+        full_loader = DataLoader(full_dataset_scaled, batch_size=args.batch_size, shuffle=True)
+        final_class_weights = compute_class_weights(full_dataset_scaled.tensors[1]).to(device)
+        
+        for am in adj_modes:
+            final_model = create_feature_model(
+                input_dim=feature_dim, num_classes=2, model_type='agcn_style',
+                device=device, adj_mode=am, classifier_type='linear'
+            )
+            
+            criterion = nn.CrossEntropyLoss(weight=final_class_weights)
+            optimizer = optim.AdamW(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+            
+            for epoch in range(args.epochs):
+                train_loss, train_acc = train_epoch(final_model, full_loader, criterion, optimizer, device)
+                scheduler.step(train_loss)
+                        
+            if hasattr(final_model, 'analyze_adjacency'):
+                final_model.analyze_adjacency(save_dir=args.save_dir)
+            
+            # Train final ML classifiers
+            full_feats, full_labels = extract_features_from_model(final_model, full_loader, device)
+            final_xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, eval_metric='logloss', random_state=args.seed)
+            final_xgb.fit(full_feats, full_labels)
+            
+            final_rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=args.seed)
+            final_rf.fit(full_feats, full_labels)
+
+            # Save dictionary
+            model_save_path = os.path.join(args.save_dir, f'best_model_{am}.pt')
+            save_dict = {
+                'model_state_dict': final_model.state_dict(),
+                'model_type': 'agcn_style',
+                'adj_mode': am,
+                'feature_dim': feature_dim,
+                'dataset_source': args.dataset_source,
+                'medication_filter': args.medication_filter,
+                'xgb_model': final_xgb,
+                'rf_model': final_rf,
+                'args': vars(args)
+            }
+            torch.save(save_dict, model_save_path)
+            print(f"Saved final model to: {model_save_path}")
+            
     print(f"\n{cv_name} Training complete!")
 
 

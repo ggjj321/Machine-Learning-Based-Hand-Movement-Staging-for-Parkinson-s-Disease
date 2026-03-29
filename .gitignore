@@ -53,6 +53,7 @@ acgn_exp/skeleton_sequences_4_to_8/
 *.csv
 *.xlsx
 *.mp4
+*.svg
 
 # Project specific folders (hand-view_classifier)
 classified_hand_videos/
