@@ -26,10 +26,10 @@ class PatientSkeletonDataset(Dataset):
         transform: Optional transform to apply to data
     """
     
-    def __init__(self, data_dir='/Users/wukeyang/mirlab_project/acgn_exp/horizontal_view',
+    def __init__(self, data_dir='/Users/wukeyang/mirlab_project/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/acgn_exp/horizontal_view',
                  max_frames=800, transform=None, 
                  medication_filter='no_medication',
-                 csv_path='/Users/wukeyang/mirlab_project/acgn_exp/收案_CAREs 20251009-加密 - deID.csv'):
+                 csv_path='/Users/wukeyang/mirlab_project/Machine-Learning-Based-Hand-Movement-Staging-for-Parkinson-s-Disease/acgn_exp/收案_CAREs 20251009-加密 - deID.csv'):
         """
         Args:
             data_dir: Path to horizontal_view directory containing stage folders

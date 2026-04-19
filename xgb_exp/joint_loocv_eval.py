@@ -218,7 +218,8 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
 
     # ROC 設定
     ax_roc.plot([0, 1], [0, 1], 'k--')
-    ax_roc.set_title(f'{prefix} {joint_label} LOOCV ROC',
+    title_suffix = "ROC" if args.cross_dataset else "LOOCV ROC"
+    ax_roc.set_title(f'{prefix} {joint_label} {title_suffix}',
                      fontsize=14, fontweight='bold')
     ax_roc.set_xlabel('False Positive Rate')
     ax_roc.set_ylabel('True Positive Rate')

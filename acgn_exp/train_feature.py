@@ -21,6 +21,7 @@ from sklearn.metrics import (
     roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 )
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -258,6 +259,124 @@ def plot_probability_distribution(all_targets, all_probs, save_dir, model_name, 
     print("="*60)
 
 
+def _average_fold_histories(fold_lists):
+    """Average per-epoch values across folds of potentially different lengths.
+
+    For each epoch index, averages only across folds that reached that epoch
+    (folds that stopped early simply don't contribute to later epochs).
+
+    Returns:
+        means: list of per-epoch mean values
+        stds:  list of per-epoch std values
+    """
+    if not fold_lists or not fold_lists[0]:
+        return [], []
+    max_len = max(len(f) for f in fold_lists)
+    means, stds = [], []
+    for ep in range(max_len):
+        vals = [f[ep] for f in fold_lists if ep < len(f)]
+        means.append(float(np.mean(vals)))
+        stds.append(float(np.std(vals)) if len(vals) > 1 else 0.0)
+    return means, stds
+
+
+def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
+                         save_dir, model_key, dataset_name, is_cross_dataset=False):
+    """
+    Plot training loss (+ validation loss) and validation RMSE curves.
+
+    When multiple folds are provided the curves are averaged; shaded regions
+    show ±1 std across folds.
+
+    RMSE here is the root-mean-square error between predicted disease
+    probability and the true binary label (related to Brier score):
+        RMSE = sqrt( mean( (p_i - y_i)^2 ) )
+
+    Args:
+        train_loss_folds: list of per-fold train-loss lists  [[ep0, ep1, ...], ...]
+        val_loss_folds:   list of per-fold val-loss  lists   (empty for cross-dataset)
+        val_rmse_folds:   list of per-fold val-RMSE  lists   (empty for cross-dataset)
+        save_dir:         directory to save the figure
+        model_key:        identifier string (e.g. 'separate_block')
+        dataset_name:     used in figure title / filename
+        is_cross_dataset: when True only training loss is available
+    """
+    train_mean, train_std = _average_fold_histories(train_loss_folds)
+    if not train_mean:
+        return
+
+    has_val  = bool(val_loss_folds  and val_loss_folds[0])
+    has_rmse = bool(val_rmse_folds  and val_rmse_folds[0])
+
+    n_plots = 1 + int(has_rmse)
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 5))
+    if n_plots == 1:
+        axes = [axes]
+
+    n_folds     = len(train_loss_folds)
+    fold_label  = f"(avg {n_folds} folds)" if n_folds > 1 else ""
+    cv_type_str = 'Cross-Dataset' if is_cross_dataset else f'CV ({n_folds} folds)'
+
+    # ── Plot 1: Loss ──────────────────────────────────────────────────────────
+    ax = axes[0]
+    epochs_train = range(1, len(train_mean) + 1)
+
+    ax.plot(epochs_train, train_mean, 'b-', linewidth=2,
+            label=f'Train Loss {fold_label}')
+    if n_folds > 1:
+        t_arr = np.array(train_mean)
+        s_arr = np.array(train_std)
+        ax.fill_between(epochs_train, t_arr - s_arr, t_arr + s_arr,
+                        alpha=0.2, color='blue')
+
+    if has_val:
+        val_mean, val_std = _average_fold_histories(val_loss_folds)
+        epochs_val = range(1, len(val_mean) + 1)
+        ax.plot(epochs_val, val_mean, 'r-', linewidth=2,
+                label=f'Val Loss {fold_label}')
+        if n_folds > 1:
+            v_arr = np.array(val_mean)
+            vs_arr = np.array(val_std)
+            ax.fill_between(epochs_val, v_arr - vs_arr, v_arr + vs_arr,
+                            alpha=0.2, color='red')
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Cross-Entropy Loss')
+    ax.set_title('Training / Validation Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # ── Plot 2: Val RMSE ─────────────────────────────────────────────────────
+    if has_rmse:
+        rmse_mean, rmse_std = _average_fold_histories(val_rmse_folds)
+        epochs_rmse = range(1, len(rmse_mean) + 1)
+        ax2 = axes[1]
+        ax2.plot(epochs_rmse, rmse_mean, 'g-', linewidth=2,
+                 label=f'Val RMSE {fold_label}')
+        if n_folds > 1:
+            r_arr = np.array(rmse_mean)
+            rs_arr = np.array(rmse_std)
+            ax2.fill_between(epochs_rmse, r_arr - rs_arr, r_arr + rs_arr,
+                             alpha=0.2, color='green')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('RMSE  (prob vs label)')
+        ax2.set_title('Validation RMSE')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f'{dataset_name}  |  {model_key}  |  {cv_type_str}',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+
+    os.makedirs(save_dir, exist_ok=True)
+    safe_key     = model_key.replace(' ', '_')
+    safe_dataset = dataset_name.replace(' ', '_')
+    save_path = os.path.join(save_dir, f'training_curves_{safe_key}_{safe_dataset}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved training curves to: {save_path}")
+
+
 def plot_and_report_results(results_dict, exp_name, dataset_name, save_dir, class_names=None):
     """Plot ROC curves, confusion matrices, and save metrics DataFrame."""
     import pandas as pd
@@ -435,15 +554,28 @@ def main():
         )
         
         feature_dim = train_dataset.get_feature_dim()
-        train_tensor_dataset, scaler = create_scaled_tensor_dataset(train_dataset, list(range(len(train_dataset))))
-        test_tensor_dataset, _ = create_scaled_tensor_dataset(test_dataset, list(range(len(test_dataset))), scaler=scaler)
-        class_weights = compute_class_weights(train_tensor_dataset.tensors[1]).to(device)
 
-        train_loader = DataLoader(train_tensor_dataset, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(test_tensor_dataset, batch_size=args.batch_size, shuffle=False)
-        cv_splits = [(0, None, None)] # Dummy split loop for cross_dataset
-        dataset = train_dataset # For final fallback
-        full_train_dataset = train_tensor_dataset
+        # Split old data: 80% backbone training, 20% early-stopping validation
+        # Scaler fitted on fit_idx only to avoid leakage into es / test splits
+        all_old_idx = list(range(len(train_dataset)))
+        fit_idx, es_idx = train_test_split(
+            all_old_idx, test_size=0.2, random_state=args.seed,
+            stratify=train_dataset.labels.numpy()
+        )
+        print(f"  old data split — fit: {len(fit_idx)}  es_val: {len(es_idx)}")
+
+        fit_tensor_dataset, scaler = create_scaled_tensor_dataset(train_dataset, fit_idx)
+        es_tensor_dataset, _       = create_scaled_tensor_dataset(train_dataset, es_idx, scaler=scaler)
+        test_tensor_dataset, _     = create_scaled_tensor_dataset(test_dataset, list(range(len(test_dataset))), scaler=scaler)
+        class_weights = compute_class_weights(fit_tensor_dataset.tensors[1]).to(device)
+
+        train_loader  = DataLoader(fit_tensor_dataset,  batch_size=args.batch_size, shuffle=True)
+        es_val_loader = DataLoader(es_tensor_dataset,   batch_size=args.batch_size, shuffle=False)
+        val_loader    = DataLoader(test_tensor_dataset, batch_size=args.batch_size, shuffle=False)
+
+        cv_splits = [(0, None, None)]  # dummy split loop for cross_dataset
+        dataset = train_dataset        # for final fallback
+        full_train_dataset = fit_tensor_dataset
         
         dataset_name_plot = 'CrossDataset_Old2Horiz'
         cv_name = 'Cross-Dataset'
@@ -471,7 +603,13 @@ def main():
             cv_name = f'{n_splits}-Fold CV'
             
         dataset_name_plot = args.dataset_source
-    
+
+    # Collect per-epoch metrics per adjacency mode (list of per-fold lists)
+    training_histories = {
+        am: {'train_loss': [], 'val_loss': [], 'val_rmse': []}
+        for am in adj_modes
+    }
+
     for fold_idx, train_idx, val_idx in cv_splits:
         if not args.cross_dataset:
             train_dataset_split, scaler = create_scaled_tensor_dataset(dataset, train_idx)
@@ -499,19 +637,43 @@ def main():
             best_loss = float('inf')
             best_state = None
             patience_counter = 0
-            
+
+            fold_train_losses = []
+            fold_val_losses   = []
+            fold_val_rmses    = []
+
             # Train Backbone
+            fold_label = f"fold {fold_idx}" if not args.cross_dataset else "cross-dataset"
             for epoch in range(args.epochs):
-                train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-                
+                train_loss, _ = train_epoch(model, train_loader, criterion, optimizer, device)
+                fold_train_losses.append(train_loss)
+
                 if args.cross_dataset:
-                    # Rely on train_loss for early stopping cross_dataset to prevent leaking test set info
-                    val_loss = train_loss 
-                    scheduler.step(train_loss)
-                else:
-                    val_loss, val_acc, _, _, _ = evaluate(model, val_loader, criterion, device)
+                    # Use held-out old-data split for early stopping (no horizontal leakage)
+                    val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, es_val_loader, criterion, device)
+                    fold_val_losses.append(val_loss)
+                    val_rmse = float(np.sqrt(np.mean(
+                        (np.array(_prob_ep) - np.array(_tgt_ep, dtype=float)) ** 2
+                    )))
+                    fold_val_rmses.append(val_rmse)
                     scheduler.step(val_loss)
-                
+                    print(f"  [{am}] {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
+                          f" | train_loss {train_loss:.4f} | es_val_loss {val_loss:.4f}"
+                          f" | es_val_acc {val_acc:.3f} | es_val_rmse {val_rmse:.4f}"
+                          f" | patience {patience_counter}/{args.patience}", end='\r')
+                else:
+                    val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, val_loader, criterion, device)
+                    fold_val_losses.append(val_loss)
+                    val_rmse = float(np.sqrt(np.mean(
+                        (np.array(_prob_ep) - np.array(_tgt_ep, dtype=float)) ** 2
+                    )))
+                    fold_val_rmses.append(val_rmse)
+                    scheduler.step(val_loss)
+                    print(f"  [{am}] {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
+                          f" | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}"
+                          f" | val_acc {val_acc:.3f} | val_rmse {val_rmse:.4f}"
+                          f" | patience {patience_counter}/{args.patience}", end='\r')
+
                 if val_loss < best_loss:
                     best_loss = val_loss
                     patience_counter = 0
@@ -519,7 +681,15 @@ def main():
                 else:
                     patience_counter += 1
                     if patience_counter >= args.patience:
+                        print()  # newline before early stopping message
+                        print(f"  [{am}] {fold_label} | early stopping at epoch {epoch+1}")
                         break
+            else:
+                print()  # newline after loop completes normally
+
+            training_histories[am]['train_loss'].append(fold_train_losses)
+            training_histories[am]['val_loss'].append(fold_val_losses)
+            training_histories[am]['val_rmse'].append(fold_val_rmses)
             
             # Evaluate using best model
             if best_state is not None:
@@ -571,11 +741,23 @@ def main():
     
     # Plot Evaluation Results for all Combinations
     table_res = plot_and_report_results(
-        aggregated_results, 
+        aggregated_results,
         exp_name="acgn_agcn_style",
-        dataset_name=dataset_name_plot, 
+        dataset_name=dataset_name_plot,
         save_dir=args.save_dir
     )
+
+    # Plot training curves (loss + RMSE) for each adjacency mode
+    for am in adj_modes:
+        plot_training_curves(
+            train_loss_folds=training_histories[am]['train_loss'],
+            val_loss_folds=training_histories[am]['val_loss'],
+            val_rmse_folds=training_histories[am]['val_rmse'],
+            save_dir=args.save_dir,
+            model_key=am,
+            dataset_name=dataset_name_plot,
+            is_cross_dataset=args.cross_dataset
+        )
     
     if args.cross_dataset:
         print("\n" + "-"*60)
@@ -629,7 +811,7 @@ def main():
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
             
             for epoch in range(args.epochs):
-                train_loss, train_acc = train_epoch(final_model, full_loader, criterion, optimizer, device)
+                train_loss, _ = train_epoch(final_model, full_loader, criterion, optimizer, device)
                 scheduler.step(train_loss)
                         
             if hasattr(final_model, 'analyze_adjacency'):
