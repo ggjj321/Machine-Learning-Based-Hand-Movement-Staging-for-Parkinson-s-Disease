@@ -62,8 +62,21 @@ def filter_joint_columns(columns, joint_indices):
 # ==========================================
 # 2. 評估指標計算
 # ==========================================
-def evaluate_predictions(y_true, y_prob, use_youden=False):
-    """計算最佳閾值 (Youden Index) 及相關指標"""
+def evaluate_predictions(y_true, y_prob, use_youden=False, external_threshold=None):
+    """計算最佳閾值 (Youden Index) 及相關指標.
+
+    Parameters
+    ----------
+    y_true, y_prob : array-like
+        Ground-truth labels and predicted probabilities for the evaluation set.
+    use_youden : bool
+        If True and no ``external_threshold`` is supplied, compute Youden's J on
+        (y_true, y_prob). WARNING: in cross-cohort evaluation this is a form of
+        test-set leakage; pass an ``external_threshold`` derived from a
+        source-cohort LOOCV instead.
+    external_threshold : float or None
+        If not None, use this as the decision threshold and skip Youden lookup.
+    """
     if len(np.unique(y_true)) < 2:
         return (0.5, 0.0,
                 accuracy_score(y_true, (y_prob >= 0.5).astype(int)),
@@ -74,7 +87,9 @@ def evaluate_predictions(y_true, y_prob, use_youden=False):
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
     roc_auc = auc(fpr, tpr)
 
-    if use_youden:
+    if external_threshold is not None:
+        best_threshold = float(external_threshold)
+    elif use_youden:
         J = tpr - fpr
         best_idx = np.argmax(J)
         best_threshold = thresholds[best_idx]
@@ -89,6 +104,59 @@ def evaluate_predictions(y_true, y_prob, use_youden=False):
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 
     return best_threshold, roc_auc, acc, prec, rec, f1, cm, fpr, tpr
+
+
+# ==========================================
+# 2b. Source-cohort LOOCV Youden threshold helper
+# ==========================================
+def compute_source_loocv_thresholds(X_train_sel, y_train, scale_pos_weight):
+    """Run LOOCV on the source (training) cohort and return Youden-optimal
+    thresholds per classifier name.
+
+    Used by cross-dataset evaluation so the operating point is derived from
+    source-only out-of-fold predictions and applied unchanged to the held-out
+    target cohort. This avoids fitting the threshold on test-cohort labels.
+    """
+    n = len(y_train)
+    classifiers = get_classifiers(scale_pos_weight)
+    oof = {name: np.full(n, 0.5) for name, _ in classifiers}
+    loo = LeaveOneOut()
+
+    for tr_idx, te_idx in tqdm(loo.split(X_train_sel),
+                                total=n, desc="Source LOOCV (for threshold)"):
+        X_tr = X_train_sel.iloc[tr_idx]
+        X_te = X_train_sel.iloc[te_idx]
+        y_tr = y_train.iloc[tr_idx].values
+
+        med = X_tr.median(numeric_only=True)
+        X_tr_f = X_tr.fillna(med)
+        X_te_f = X_te.fillna(med)
+        sc = StandardScaler()
+        X_tr_s = sc.fit_transform(X_tr_f)
+        X_te_s = sc.transform(X_te_f)
+
+        for name, clf_tpl in classifiers:
+            try:
+                from sklearn.base import clone
+                clf = clone(clf_tpl)
+                clf.fit(X_tr_s, y_tr)
+                oof[name][te_idx[0]] = clf.predict_proba(X_te_s)[:, 1][0]
+            except Exception:
+                oof[name][te_idx[0]] = 0.5
+
+    thresholds = {}
+    y_tr_arr = y_train.values if hasattr(y_train, 'values') else np.asarray(y_train)
+    for name, probs in oof.items():
+        if len(np.unique(y_tr_arr)) < 2:
+            thresholds[name] = 0.5
+            continue
+        fpr, tpr, thr = roc_curve(y_tr_arr, probs)
+        J = tpr - fpr
+        thresholds[name] = float(thr[np.argmax(J)])
+    print("\n[Source-LOOCV Youden thresholds]")
+    for k, v in thresholds.items():
+        print(f"  {k:<22s}  thr={v:.4f}")
+    return thresholds
 
 
 # ==========================================
@@ -167,8 +235,14 @@ def run_joint_loocv(X, y_binary, args, dataset_name, joint_label):
 # ==========================================
 # 5. 視覺化及報表輸出
 # ==========================================
-def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_binary=None):
-    """ROC 曲線、混淆矩陣、指標表格"""
+def plot_and_report(results_dict, dataset_name, args, joint_label,
+                    X=None, y_binary=None, thresholds_override=None):
+    """ROC 曲線、混淆矩陣、指標表格.
+
+    ``thresholds_override`` (optional dict: model_name → float) supplies a
+    fixed decision threshold per model (e.g. the Youden threshold computed on
+    the source cohort in cross-dataset mode), bypassing test-set Youden.
+    """
     os.makedirs(args.save_dir, exist_ok=True)
 
     n_models = len(results_dict)
@@ -183,8 +257,13 @@ def plot_and_report(results_dict, dataset_name, args, joint_label, X=None, y_bin
         y_true_all = np.array(data['y_true'])
         y_prob_all = np.array(data['y_prob'])
 
+        ext_thr = None
+        if thresholds_override is not None and name in thresholds_override:
+            ext_thr = thresholds_override[name]
         thresh, roc_auc, acc, prec, rec, f1, cm, fpr, tpr = \
-            evaluate_predictions(y_true_all, y_prob_all, use_youden=args.use_youden)
+            evaluate_predictions(y_true_all, y_prob_all,
+                                  use_youden=args.use_youden,
+                                  external_threshold=ext_thr)
 
         table_results.append({
             'Model': name,
@@ -381,7 +460,7 @@ def main():
         X_test_scaled = scaler.transform(X_test_filled)
         
         aggregated = {name: {'y_true': y_test_binary.tolist(), 'y_prob': [], 'importances': []} for name, _ in classifiers}
-        
+
         for name, clf in classifiers:
             clf.fit(X_train_scaled, y_train.values)
             prob = clf.predict_proba(X_test_scaled)[:, 1]
@@ -393,9 +472,19 @@ def main():
             else:
                 imp = np.zeros(X_train_sel.shape[1])
             aggregated[name]['importances'] = [imp]
-            
+
+        # ---- Derive Youden threshold from a LOOCV pass on the SOURCE cohort
+        # so the operating point applied to the held-out 2025 cohort is not
+        # tuned on test labels.
+        src_thresholds = None
+        if args.use_youden:
+            src_thresholds = compute_source_loocv_thresholds(
+                X_train_sel, y_train, scale_pos_weight)
+
         global_year_override = "CrossDataset_Old2Horiz"
-        plot_and_report(aggregated, global_year_override, args, joint_label, X_test_sel, y_test_binary)
+        plot_and_report(aggregated, global_year_override, args, joint_label,
+                         X_test_sel, y_test_binary,
+                         thresholds_override=src_thresholds)
 
     else:
         if args.dataset_source == 'all':
