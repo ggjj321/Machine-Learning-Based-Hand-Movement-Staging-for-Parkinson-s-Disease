@@ -4,9 +4,7 @@ Training Script for Feature-based PD Classification
 Train AGCN-style models using pre-computed frequency domain features
 for binary classification (Healthy vs Disease).
 
-Supports:
-- Evaluate all classifier backends: linear, xgboost, random_forest
-- Evaluate both adjacency modes: separate_block and same_block
+Model: AGCN (Linear) — same_block adjacency, linear classifier
 """
 
 import os
@@ -24,14 +22,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-try:
-    from xgboost import XGBClassifier
-    HAS_XGBOOST = True
-except ImportError:
-    HAS_XGBOOST = False
-
-from sklearn.ensemble import RandomForestClassifier
 
 from feature_dataset import FeatureDataset, get_kfold_splits, get_loocv_splits
 from models.feature_mlp import create_feature_model
@@ -401,11 +391,10 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, save_dir, clas
         y_true_all = np.array(data['y_true'])
         y_prob_all = np.array(data['y_prob'])
 
-        # Use a fixed decision threshold so evaluation does not tune on the
-        # same validation/test predictions it reports.
-        fpr, tpr, _ = roc_curve(y_true_all, y_prob_all)
+        fpr, tpr, thresholds = roc_curve(y_true_all, y_prob_all)
         roc_auc = auc(fpr, tpr)
-        decision_threshold = 0.5
+        J = tpr - fpr
+        decision_threshold = float(thresholds[np.argmax(J)])
 
         y_pred = (y_prob_all >= decision_threshold).astype(int)
         acc = accuracy_score(y_true_all, y_pred)
@@ -508,30 +497,17 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     
-    # Validate XGBoost availability
-    if not HAS_XGBOOST:
-        raise ImportError("XGBoost is required but not installed. Run: pip install xgboost")
-    
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 
+    device = torch.device('cuda' if torch.cuda.is_available() else
                           'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print("Model type: agcn_style")
-    print("Classifier backends: linear, xgboost, random_forest")
-    print("Adjacency modes: separate_block, same_block")
+    print("Model: AGCN (Linear) | same_block adjacency, linear classifier")
     print(f"Dataset source: {args.dataset_source}")
-    
+
     # Create checkpoint directory
     os.makedirs(args.save_dir, exist_ok=True)
-    
-    # Always run the full AGCN comparison matrix.
-    adj_modes = ['separate_block', 'same_block']
-    clf_types = ['linear', 'xgboost', 'random_forest']
 
-    aggregated_results = {
-        f"{am}_{ct}": {'y_true': [], 'y_prob': []} 
-        for am in adj_modes for ct in clf_types
-    }
+    aggregated_results = {'AGCN (Linear)': {'y_true': [], 'y_prob': []}}
     
     cross_dataset_saved_models = {}
     
@@ -604,11 +580,8 @@ def main():
             
         dataset_name_plot = args.dataset_source
 
-    # Collect per-epoch metrics per adjacency mode (list of per-fold lists)
-    training_histories = {
-        am: {'train_loss': [], 'val_loss': [], 'val_rmse': []}
-        for am in adj_modes
-    }
+    # Collect per-epoch metrics (list of per-fold lists)
+    training_histories = {'train_loss': [], 'val_loss': [], 'val_rmse': []}
 
     for fold_idx, train_idx, val_idx in cv_splits:
         if not args.cross_dataset:
@@ -618,114 +591,78 @@ def main():
 
             train_loader = DataLoader(train_dataset_split, batch_size=args.batch_size, shuffle=True)
             val_loader = DataLoader(val_dataset_split, batch_size=args.batch_size, shuffle=False)
-        
-        # For each adjacency mode, train a backbone and run all classifiers
-        for am in adj_modes:
-            model = create_feature_model(
-                input_dim=feature_dim,
-                num_classes=2,
-                model_type='agcn_style',
-                device=device,
-                adj_mode=am,
-                classifier_type='linear'  # We train linear end-to-end to serve as robust feature extractor
-            )
-            
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
-            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
-            
-            best_loss = float('inf')
-            best_state = None
-            patience_counter = 0
 
-            fold_train_losses = []
-            fold_val_losses   = []
-            fold_val_rmses    = []
+        model = create_feature_model(
+            input_dim=feature_dim,
+            num_classes=2,
+            model_type='agcn_style',
+            device=device,
+            adj_mode='same_block',
+            classifier_type='linear'
+        )
 
-            # Train Backbone
-            fold_label = f"fold {fold_idx}" if not args.cross_dataset else "cross-dataset"
-            for epoch in range(args.epochs):
-                train_loss, _ = train_epoch(model, train_loader, criterion, optimizer, device)
-                fold_train_losses.append(train_loss)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
-                if args.cross_dataset:
-                    # Use held-out old-data split for early stopping (no horizontal leakage)
-                    val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, es_val_loader, criterion, device)
-                    fold_val_losses.append(val_loss)
-                    val_rmse = float(np.sqrt(np.mean(
-                        (np.array(_prob_ep) - np.array(_tgt_ep, dtype=float)) ** 2
-                    )))
-                    fold_val_rmses.append(val_rmse)
-                    scheduler.step(val_loss)
-                    print(f"  [{am}] {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
-                          f" | train_loss {train_loss:.4f} | es_val_loss {val_loss:.4f}"
-                          f" | es_val_acc {val_acc:.3f} | es_val_rmse {val_rmse:.4f}"
-                          f" | patience {patience_counter}/{args.patience}", end='\r')
-                else:
-                    val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, val_loader, criterion, device)
-                    fold_val_losses.append(val_loss)
-                    val_rmse = float(np.sqrt(np.mean(
-                        (np.array(_prob_ep) - np.array(_tgt_ep, dtype=float)) ** 2
-                    )))
-                    fold_val_rmses.append(val_rmse)
-                    scheduler.step(val_loss)
-                    print(f"  [{am}] {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
-                          f" | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}"
-                          f" | val_acc {val_acc:.3f} | val_rmse {val_rmse:.4f}"
-                          f" | patience {patience_counter}/{args.patience}", end='\r')
+        best_loss = float('inf')
+        best_state = None
+        patience_counter = 0
 
-                if val_loss < best_loss:
-                    best_loss = val_loss
-                    patience_counter = 0
-                    best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                else:
-                    patience_counter += 1
-                    if patience_counter >= args.patience:
-                        print()  # newline before early stopping message
-                        print(f"  [{am}] {fold_label} | early stopping at epoch {epoch+1}")
-                        break
-            else:
-                print()  # newline after loop completes normally
+        fold_train_losses = []
+        fold_val_losses   = []
+        fold_val_rmses    = []
 
-            training_histories[am]['train_loss'].append(fold_train_losses)
-            training_histories[am]['val_loss'].append(fold_val_losses)
-            training_histories[am]['val_rmse'].append(fold_val_rmses)
-            
-            # Evaluate using best model
-            if best_state is not None:
-                model.load_state_dict(best_state)
-                
-            # 1. Linear Evaluation (uses native model predictions)
-            _, _, fold_preds_lin, fold_targets_lin, fold_probs_lin = evaluate(model, val_loader, criterion, device)
-            aggregated_results[f"{am}_linear"]['y_true'].extend(fold_targets_lin)
-            aggregated_results[f"{am}_linear"]['y_prob'].extend(fold_probs_lin)
-            
-            # 2. Extract features
-            train_feats, train_labels = extract_features_from_model(model, train_loader, device)
-            val_feats, val_labels = extract_features_from_model(model, val_loader, device)
-            
-            # 3. XGBoost
-            xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, eval_metric='logloss', random_state=args.seed)
-            xgb.fit(train_feats, train_labels)
-            fold_probs_xgb = xgb.predict_proba(val_feats)[:, 1].tolist()
-            aggregated_results[f"{am}_xgboost"]['y_true'].extend(val_labels.tolist())
-            aggregated_results[f"{am}_xgboost"]['y_prob'].extend(fold_probs_xgb)
-            
-            # 4. Random Forest
-            rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=args.seed)
-            rf.fit(train_feats, train_labels)
-            fold_probs_rf = rf.predict_proba(val_feats)[:, 1].tolist()
-            aggregated_results[f"{am}_random_forest"]['y_true'].extend(val_labels.tolist())
-            aggregated_results[f"{am}_random_forest"]['y_prob'].extend(fold_probs_rf)
+        fold_label = f"fold {fold_idx}" if not args.cross_dataset else "cross-dataset"
+        for epoch in range(args.epochs):
+            train_loss, _ = train_epoch(model, train_loader, criterion, optimizer, device)
+            fold_train_losses.append(train_loss)
 
             if args.cross_dataset:
-                # Save models immediately to avoid retraining on cross-dataset evaluation later
-                cross_dataset_saved_models[am] = {
-                    'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
-                    'xgb_model': xgb,
-                    'rf_model': rf
-                }
-            
+                val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, es_val_loader, criterion, device)
+            else:
+                val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, val_loader, criterion, device)
+
+            fold_val_losses.append(val_loss)
+            val_rmse = float(np.sqrt(np.mean(
+                (np.array(_prob_ep) - np.array(_tgt_ep, dtype=float)) ** 2
+            )))
+            fold_val_rmses.append(val_rmse)
+            scheduler.step(val_loss)
+            print(f"  {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
+                  f" | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}"
+                  f" | val_acc {val_acc:.3f} | val_rmse {val_rmse:.4f}"
+                  f" | patience {patience_counter}/{args.patience}", end='\r')
+
+            if val_loss < best_loss:
+                best_loss = val_loss
+                patience_counter = 0
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print()
+                    print(f"  {fold_label} | early stopping at epoch {epoch+1}")
+                    break
+        else:
+            print()
+
+        training_histories['train_loss'].append(fold_train_losses)
+        training_histories['val_loss'].append(fold_val_losses)
+        training_histories['val_rmse'].append(fold_val_rmses)
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        _, _, _, fold_targets_lin, fold_probs_lin = evaluate(model, val_loader, criterion, device)
+        aggregated_results['AGCN (Linear)']['y_true'].extend(fold_targets_lin)
+        aggregated_results['AGCN (Linear)']['y_prob'].extend(fold_probs_lin)
+
+        if args.cross_dataset:
+            cross_dataset_saved_models['same_block'] = {
+                'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
+            }
+
         if not args.cross_dataset:
             if args.cv_type == 'loocv':
                 if (fold_idx + 1) % 50 == 0 or fold_idx == n_splits - 1:
@@ -733,113 +670,87 @@ def main():
             else:
                 print(f"Fold {fold_idx+1}/{n_splits} Evaluated.")
         else:
-            print("Cross-dataset evaluation completed for both adjacency modes.")
-            
+            print("Cross-dataset evaluation completed.")
+
     print("\n" + "="*60)
-    print(f"{cv_name} Results (AGCN_STYLE):")
+    print(f"{cv_name} Results — AGCN (Linear):")
     print("="*60)
-    
-    # Plot Evaluation Results for all Combinations
+
     table_res = plot_and_report_results(
         aggregated_results,
-        exp_name="acgn_agcn_style",
+        exp_name="AGCN_Linear",
         dataset_name=dataset_name_plot,
         save_dir=args.save_dir
     )
 
-    # Plot training curves (loss + RMSE) for each adjacency mode
-    for am in adj_modes:
-        plot_training_curves(
-            train_loss_folds=training_histories[am]['train_loss'],
-            val_loss_folds=training_histories[am]['val_loss'],
-            val_rmse_folds=training_histories[am]['val_rmse'],
-            save_dir=args.save_dir,
-            model_key=am,
-            dataset_name=dataset_name_plot,
-            is_cross_dataset=args.cross_dataset
-        )
+    plot_training_curves(
+        train_loss_folds=training_histories['train_loss'],
+        val_loss_folds=training_histories['val_loss'],
+        val_rmse_folds=training_histories['val_rmse'],
+        save_dir=args.save_dir,
+        model_key='AGCN (Linear)',
+        dataset_name=dataset_name_plot,
+        is_cross_dataset=args.cross_dataset
+    )
     
     if args.cross_dataset:
         print("\n" + "-"*60)
-        print("Saving cross-dataset models (already trained on all source data)...")
+        print("Saving cross-dataset model...")
         print("-"*60)
-        for am in adj_modes:
-            saved = cross_dataset_saved_models[am]
-            
-            # Recreate model skeleton to easily run adjacency analysis if exists
-            final_model = create_feature_model(
-                input_dim=feature_dim, num_classes=2, model_type='agcn_style',
-                device=device, adj_mode=am, classifier_type='linear'
-            )
-            final_model.load_state_dict(saved['model_state_dict'])
-            
-            if hasattr(final_model, 'analyze_adjacency'):
-                final_model.analyze_adjacency(save_dir=args.save_dir)
-                
-            model_save_path = os.path.join(args.save_dir, f'best_model_{am}.pt')
-            save_dict = {
-                'model_state_dict': saved['model_state_dict'],
-                'model_type': 'agcn_style',
-                'adj_mode': am,
-                'feature_dim': feature_dim,
-                'dataset_source': args.dataset_source,
-                'medication_filter': args.medication_filter,
-                'xgb_model': saved['xgb_model'],
-                'rf_model': saved['rf_model'],
-                'args': vars(args)
-            }
-            torch.save(save_dict, model_save_path)
-            print(f"Saved final cross-dataset model to: {model_save_path}")
+        saved = cross_dataset_saved_models['same_block']
+        final_model = create_feature_model(
+            input_dim=feature_dim, num_classes=2, model_type='agcn_style',
+            device=device, adj_mode='same_block', classifier_type='linear'
+        )
+        final_model.load_state_dict(saved['model_state_dict'])
+        if hasattr(final_model, 'analyze_adjacency'):
+            final_model.analyze_adjacency(save_dir=args.save_dir)
+        model_save_path = os.path.join(args.save_dir, 'best_model_same_block.pt')
+        torch.save({
+            'model_state_dict': saved['model_state_dict'],
+            'model_type': 'agcn_style',
+            'adj_mode': 'same_block',
+            'feature_dim': feature_dim,
+            'dataset_source': args.dataset_source,
+            'medication_filter': args.medication_filter,
+            'args': vars(args)
+        }, model_save_path)
+        print(f"Saved final cross-dataset model to: {model_save_path}")
     else:
-        # Train final models on all data for cross-validation evaluation/serving
         print("\n" + "-"*60)
-        print("Training final backbone models on all data...")
+        print("Training final model on all data...")
         print("-"*60)
-        
+
         full_dataset_scaled, _ = create_scaled_tensor_dataset(dataset, list(range(len(dataset))))
         full_loader = DataLoader(full_dataset_scaled, batch_size=args.batch_size, shuffle=True)
         final_class_weights = compute_class_weights(full_dataset_scaled.tensors[1]).to(device)
-        
-        for am in adj_modes:
-            final_model = create_feature_model(
-                input_dim=feature_dim, num_classes=2, model_type='agcn_style',
-                device=device, adj_mode=am, classifier_type='linear'
-            )
-            
-            criterion = nn.CrossEntropyLoss(weight=final_class_weights)
-            optimizer = optim.AdamW(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
-            
-            for epoch in range(args.epochs):
-                train_loss, _ = train_epoch(final_model, full_loader, criterion, optimizer, device)
-                scheduler.step(train_loss)
-                        
-            if hasattr(final_model, 'analyze_adjacency'):
-                final_model.analyze_adjacency(save_dir=args.save_dir)
-            
-            # Train final ML classifiers
-            full_feats, full_labels = extract_features_from_model(final_model, full_loader, device)
-            final_xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, eval_metric='logloss', random_state=args.seed)
-            final_xgb.fit(full_feats, full_labels)
-            
-            final_rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=args.seed)
-            final_rf.fit(full_feats, full_labels)
 
-            # Save dictionary
-            model_save_path = os.path.join(args.save_dir, f'best_model_{am}.pt')
-            save_dict = {
-                'model_state_dict': final_model.state_dict(),
-                'model_type': 'agcn_style',
-                'adj_mode': am,
-                'feature_dim': feature_dim,
-                'dataset_source': args.dataset_source,
-                'medication_filter': args.medication_filter,
-                'xgb_model': final_xgb,
-                'rf_model': final_rf,
-                'args': vars(args)
-            }
-            torch.save(save_dict, model_save_path)
-            print(f"Saved final model to: {model_save_path}")
+        final_model = create_feature_model(
+            input_dim=feature_dim, num_classes=2, model_type='agcn_style',
+            device=device, adj_mode='same_block', classifier_type='linear'
+        )
+        criterion = nn.CrossEntropyLoss(weight=final_class_weights)
+        optimizer = optim.AdamW(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+
+        for epoch in range(args.epochs):
+            train_loss, _ = train_epoch(final_model, full_loader, criterion, optimizer, device)
+            scheduler.step(train_loss)
+
+        if hasattr(final_model, 'analyze_adjacency'):
+            final_model.analyze_adjacency(save_dir=args.save_dir)
+
+        model_save_path = os.path.join(args.save_dir, 'best_model_same_block.pt')
+        torch.save({
+            'model_state_dict': final_model.state_dict(),
+            'model_type': 'agcn_style',
+            'adj_mode': 'same_block',
+            'feature_dim': feature_dim,
+            'dataset_source': args.dataset_source,
+            'medication_filter': args.medication_filter,
+            'args': vars(args)
+        }, model_save_path)
+        print(f"Saved final model to: {model_save_path}")
             
     print(f"\n{cv_name} Training complete!")
 
