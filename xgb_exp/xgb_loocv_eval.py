@@ -39,18 +39,22 @@ def logistic_l1_fs(X_train, y_train, k=10, C=0.5):
     if len(np.unique(y_train)) < 2: return X_train.columns[:k].tolist()
     model = LogisticRegression(penalty='l1', C=C, solver='liblinear', class_weight='balanced', random_state=42, max_iter=1000)
     model.fit(X_scaled, y_train)
-    coefs = np.abs(model.coef_[0]) if y_train.ndim == 1 else np.abs(model.coef_).mean(axis=0)
+    # model.coef_ has shape (1, n_features) for binary targets and
+    # (n_classes, n_features) for multi-class (liblinear uses one-vs-rest).
+    coefs = np.abs(model.coef_[0]) if model.coef_.shape[0] == 1 else np.abs(model.coef_).mean(axis=0)
     scores = pd.Series(coefs, index=X_train.columns).sort_values(ascending=False)
     return scores.head(k).index.tolist()
 
 def xgboost_fs(X_train, y_train, k=10):
     X_num = X_train.fillna(X_train.median(numeric_only=True))
-    n_neg = np.sum(y_train == 0)
-    n_pos = np.sum(y_train == 1)
-    scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
     if len(np.unique(y_train)) < 2: return X_train.columns[:k].tolist()
-    model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, scale_pos_weight=scale_pos_weight,
-                          eval_metric='logloss', random_state=42, n_jobs=1)
+    kwargs = dict(n_estimators=50, max_depth=3, learning_rate=0.1,
+                  eval_metric='logloss', random_state=42, n_jobs=1)
+    if len(np.unique(y_train)) == 2:
+        n_neg = np.sum(y_train == 0)
+        n_pos = np.sum(y_train == 1)
+        kwargs['scale_pos_weight'] = n_neg / n_pos if n_pos > 0 else 1.0
+    model = XGBClassifier(**kwargs)
     model.fit(X_num, y_train)
     imp_dict = model.get_booster().get_score(importance_type="gain")
     scores = pd.Series(imp_dict).reindex(X_train.columns).fillna(0).sort_values(ascending=False)
@@ -89,6 +93,16 @@ def evaluate_predictions(y_true, y_prob, use_youden=False, external_threshold=No
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 
     return best_threshold, roc_auc, acc, prec, rec, f1, cm, fpr, tpr
+
+
+def evaluate_multiclass_predictions(y_true, y_pred, class_labels):
+    """多分類評估指標 (無 ROC/AUC/Youden，直接以預測類別計算)."""
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, labels=class_labels, average='macro', zero_division=0)
+    rec = recall_score(y_true, y_pred, labels=class_labels, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, labels=class_labels, average='macro', zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=class_labels)
+    return acc, prec, rec, f1, cm
 
 
 # ==========================================
@@ -172,6 +186,24 @@ def train_and_predict_xgb(X_train, y_train, X_test, fs_func, k_features, feature
     prob = clf.predict_proba(X_test[top_cols])[:, 1][0]
     return prob
 
+def train_and_predict_xgb_multiclass(X_train, y_train, X_test, fs_func, k_features, feature_counter_dict=None):
+    """特徵選擇後訓練 XGBoost 多分類模型並回傳預測類別 (非機率)"""
+    top_cols = fs_func(X_train, y_train, k=k_features)
+
+    if feature_counter_dict is not None and top_cols:
+        feature_counter_dict.update(top_cols)
+
+    if not top_cols:
+        return Counter(y_train).most_common(1)[0][0]
+
+    if len(np.unique(y_train)) < 2:
+        return y_train[0]
+
+    clf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1,
+                        eval_metric='mlogloss', random_state=42, n_jobs=1)
+    clf.fit(X_train[top_cols], y_train)
+    return clf.predict(X_test[top_cols])[0]
+
 def train_and_predict_lda_xgb(X_train, y_train_bin, y_train_mul, X_test):
     """LDA 降維後訓練 XGBoost 並回傳預測機率"""
     if len(np.unique(y_train_mul)) < 2:
@@ -207,21 +239,21 @@ def _make_graph_classifiers(spw):
             scale_pos_weight=spw, eval_metric='logloss',
             random_state=42, n_jobs=1,
         ),
-        "LR": LogisticRegression(
-            C=1.0, solver='lbfgs', max_iter=2000,
-            class_weight='balanced', random_state=42,
-        ),
-        "RF": RandomForestClassifier(
-            n_estimators=200, max_depth=5, class_weight='balanced',
-            random_state=42, n_jobs=1,
-        ),
+        # "LR": LogisticRegression(
+        #     C=1.0, solver='lbfgs', max_iter=2000,
+        #     class_weight='balanced', random_state=42,
+        # ),
+        # "RF": RandomForestClassifier(
+        #     n_estimators=200, max_depth=5, class_weight='balanced',
+        #     random_state=42, n_jobs=1,
+        # ),
     }
 
 
 # ==========================================
 # 4. 評估流程：一般 LOOCV (所有特徵混合)
 # ==========================================
-def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods, hand_label="Both"):
+def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods, hand_label="Both", patient_meta=None):
     exp_name = "Standard_LOOCV" if hand_label == "Both" else f"Standard_{hand_label}_Hand_LOOCV"
     print(f"\n--- 開始執行 {exp_name} (總樣本數: {len(y_binary)}) ---")
     
@@ -264,14 +296,52 @@ def run_standard_loocv(X, y_binary, y_multi, args, dataset_name, fs_methods, han
             
     # 繪製圖表與產生報表
     plot_and_report_results(aggregated_results, exp_name, dataset_name, args)
-    
+
     # 新增 Top 2 特徵散佈圖 (只有當包含雙手或 Both 時才繪製)
     if hand_label == "Both":
         X_dict = {name: X for name in feature_counters.keys()}
         plot_scatter_top2(feature_counters, X_dict, y_binary, exp_name, dataset_name, args)
-    
+
     # 顯示特徵頻率
     print_top_features(feature_counters, args.k_features, len(y_binary))
+
+    # 錯誤分析: False Negative 的 stage 成分 + 三方法同時出錯的病人
+    analyze_prediction_errors(aggregated_results, patient_meta, args, exp_name, dataset_name,
+                              base_method_names=[m[0] for m in fs_methods], hand_label=hand_label)
+
+
+# ==========================================
+# 4b. 評估流程：一般 LOOCV，多分類標籤 (例如 Dominant)
+# ==========================================
+def run_standard_loocv_multiclass(X, y_multi, args, dataset_name, fs_methods, hand_label="Both", label_name="Dominant"):
+    exp_name = "Standard_LOOCV" if hand_label == "Both" else f"Standard_{hand_label}_Hand_LOOCV"
+    print(f"\n--- 開始執行 {exp_name} [{label_name} 多分類] (總樣本數: {len(y_multi)}) ---")
+
+    class_labels = sorted(np.unique(y_multi.values).tolist())
+    all_method_names = [m[0] for m in fs_methods]
+
+    aggregated_results = {name: {'y_true': [], 'y_pred': []} for name in all_method_names}
+    feature_counters = {name: Counter() for name in all_method_names}
+
+    loo = LeaveOneOut()
+
+    for train_index, test_index in tqdm(loo.split(X), total=len(X), desc="Standard LOOCV (multiclass)"):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train_mul, y_test_mul = y_multi.iloc[train_index].values, y_multi.iloc[test_index].values
+
+        y_test_val = y_test_mul[0]
+
+        for name, fs_func in fs_methods:
+            try:
+                pred = train_and_predict_xgb_multiclass(X_train, y_train_mul, X_test, fs_func, args.k_features, feature_counters[name])
+            except Exception:
+                pred = Counter(y_train_mul).most_common(1)[0][0]
+            aggregated_results[name]['y_true'].append(y_test_val)
+            aggregated_results[name]['y_pred'].append(pred)
+
+    plot_and_report_multiclass_results(aggregated_results, exp_name, dataset_name, args, class_labels, label_name=label_name)
+
+    print_top_features(feature_counters, args.k_features, len(y_multi))
 
 
 # ==========================================
@@ -404,11 +474,13 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args,
             ax_roc.plot(fpr, tpr, lw=2, label=f'{name} (AUC={roc_auc:.2f})')
 
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes_cm[i], annot_kws={"size": 14})
-        axes_cm[i].set_title(f"{name}\nThresh={thresh:.3f}", fontsize=12, fontweight='bold')
+        cm_title = name if getattr(args, 'dominant_binary', False) else f"{name}\nThresh={thresh:.3f}"
+        axes_cm[i].set_title(cm_title, fontsize=12, fontweight='bold')
         axes_cm[i].set_xlabel('Predicted')
         axes_cm[i].set_ylabel('True')
-        axes_cm[i].set_xticklabels(['Healthy', 'PD'])
-        axes_cm[i].set_yticklabels(['Healthy', 'PD'])
+        cm_labels = ['1', '2'] if getattr(args, 'dominant_binary', False) else ['Healthy', 'PD']
+        axes_cm[i].set_xticklabels(cm_labels)
+        axes_cm[i].set_yticklabels(cm_labels)
 
     prefix = _dataset_prefix(args, dataset_name)
 
@@ -442,6 +514,57 @@ def plot_and_report_results(results_dict, exp_name, dataset_name, args,
     print(df_res[cols_order].round(4).to_string(index=False))
     
     df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
+
+
+def plot_and_report_multiclass_results(results_dict, exp_name, dataset_name, args, class_labels, label_name="Dominant"):
+    """多分類版本的報表/混淆矩陣視覺化 (無 ROC/AUC，因為沒有機率門檻的概念)."""
+    table_results = []
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    n_models = len(results_dict)
+    tick_labels = [str(c) for c in class_labels]
+
+    fig_cm, axes_cm = plt.subplots(1, n_models, figsize=(6 * n_models, 5))
+    if n_models == 1: axes_cm = [axes_cm]
+
+    for i, (name, data) in enumerate(results_dict.items()):
+        y_true_all = np.array(data['y_true'])
+        y_pred_all = np.array(data['y_pred'])
+
+        acc, prec, rec, f1, cm = evaluate_multiclass_predictions(y_true_all, y_pred_all, class_labels)
+
+        table_results.append({
+            'Model': name,
+            'Acc': acc,
+            'Precision (macro)': prec,
+            'Recall (macro)': rec,
+            'F1-score (macro)': f1
+        })
+
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes_cm[i], annot_kws={"size": 14})
+        axes_cm[i].set_title(name, fontsize=12, fontweight='bold')
+        axes_cm[i].set_xlabel('Predicted')
+        axes_cm[i].set_ylabel('True')
+        axes_cm[i].set_xticklabels(tick_labels)
+        axes_cm[i].set_yticklabels(tick_labels)
+
+    prefix = _dataset_prefix(args, dataset_name)
+    exp_label = exp_name.replace('Standard_', '').replace('_', ' ').strip()
+
+    fig_suffix = f"{exp_name.replace(' ', '_')}_{label_name}_{dataset_name}"
+    fig_cm.savefig(os.path.join(args.save_dir, f'cm_{fig_suffix}.png'), bbox_inches='tight')
+
+    plt.tight_layout()
+    if not args.no_show:
+        plt.show()
+
+    df_res = pd.DataFrame(table_results)
+    cols_order = ['Model', 'Acc', 'Precision (macro)', 'Recall (macro)', 'F1-score (macro)']
+    print(f"\n=== Performance Report: {prefix} | {exp_label} [{label_name} multiclass] ===")
+    print(df_res[cols_order].round(4).to_string(index=False))
+
+    df_res[cols_order].to_csv(os.path.join(args.save_dir, f'metrics_{fig_suffix}.csv'), index=False)
+
 
 def plot_scatter_top2(feature_counters_dict, X_dict, y_binary, exp_name, dataset_name, args):
     """
@@ -514,13 +637,99 @@ def print_top_features(feature_counters, k_features, total_folds):
 
 
 # ==========================================
+# 6a-2. 錯誤分析: False Negative 的 stage 成分 + 三方法同時出錯的病人
+# ==========================================
+def analyze_prediction_errors(aggregated_results, patient_meta, args, exp_name, dataset_name,
+                              base_method_names, hand_label="Both"):
+    """分析二元分類 LOOCV 結果的錯誤模式.
+
+    1. 針對每個特徵選擇方法，統計 False Negative (真為 1、預測為 0) 樣本的
+       pd_stage 分布，找出哪些 stage 最容易被漏判。
+    2. 找出「三個特徵選擇方法同時預測錯誤」的病人，方便後續檢視是否為系統性
+       難分的樣本 (例如特徵品質差、標註邊界模糊等)。
+    """
+    if patient_meta is None or len(patient_meta) == 0:
+        return
+
+    prefix = _dataset_prefix(args, dataset_name)
+    exp_label = exp_name.replace('Standard_', '').replace('_', ' ').strip()
+    print(f"\n{'='*60}")
+    print(f"=== 錯誤分析: {prefix} | {exp_label} ({hand_label}) ===")
+    print(f"{'='*60}")
+
+    n = len(patient_meta)
+    wrong_masks = {}
+    pred_by_method = {}
+
+    for name in base_method_names:
+        if name not in aggregated_results:
+            continue
+        data = aggregated_results[name]
+        y_true = np.array(data['y_true'])
+        y_prob = np.array(data['y_prob'])
+        if len(y_true) != n:
+            continue
+
+        thresh, *_rest = evaluate_predictions(y_true, y_prob, use_youden=args.use_youden)
+        y_pred = (y_prob >= thresh).astype(int)
+        pred_by_method[name] = y_pred
+
+        is_fn = (y_true == 1) & (y_pred == 0)
+        is_wrong = y_true != y_pred
+        wrong_masks[name] = is_wrong
+
+        print(f"\n>> {name} (threshold={thresh:.3f})")
+        print(f"   False Negative 數量: {is_fn.sum()} / {n}")
+        if is_fn.sum() > 0:
+            stage_counts = patient_meta.loc[is_fn, 'pd_stage'].value_counts().sort_index()
+            df_stage = stage_counts.rename_axis('pd_stage').reset_index(name='FN 數量')
+            df_stage['佔該 stage FN 比例 (%)'] = (
+                df_stage['FN 數量'] / df_stage['pd_stage'].map(
+                    patient_meta['pd_stage'].value_counts()) * 100
+            ).round(1)
+            print(df_stage.to_string(index=False))
+
+    if len(wrong_masks) < len(base_method_names):
+        print("\n(部分方法缺少對應結果，略過三方法交集分析)")
+        return
+
+    wrong_all = np.ones(n, dtype=bool)
+    for name in base_method_names:
+        wrong_all &= wrong_masks[name]
+
+    print(f"\n>> 三個特徵選擇方法同時預測錯誤的樣本數: {wrong_all.sum()} / {n}")
+    if wrong_all.sum() > 0:
+        rows = []
+        y_true_ref = np.array(aggregated_results[base_method_names[0]]['y_true'])
+        for idx in np.where(wrong_all)[0]:
+            row = {
+                'patient_id': patient_meta.iloc[idx].get('patient_id'),
+                'date': patient_meta.iloc[idx].get('date'),
+                'pd_stage': patient_meta.iloc[idx].get('pd_stage'),
+                'y_true': y_true_ref[idx],
+            }
+            for name in base_method_names:
+                row[f'{name} pred'] = pred_by_method[name][idx]
+                row[f'{name} prob'] = aggregated_results[name]['y_prob'][idx]
+            rows.append(row)
+        df_common_errors = pd.DataFrame(rows)
+        print(df_common_errors.to_string(index=False))
+
+        os.makedirs(args.save_dir, exist_ok=True)
+        fig_suffix = f"{exp_name.replace(' ', '_')}_{hand_label}_{dataset_name}"
+        out_path = os.path.join(args.save_dir, f'common_errors_{fig_suffix}.csv')
+        df_common_errors.to_csv(out_path, index=False)
+        print(f"已儲存 → {out_path}")
+
+
+# ==========================================
 # 6b. Graph Feature Construction (GCN-style)
 # ==========================================
 
 def build_graph_features_for_patient(X_n):
     """
     X_n: (42, 42) — 42 joints × 42 features.
-    Returns a ~161-dim feature vector capturing graph structure and asymmetry.
+    Returns a ~203-dim feature vector capturing graph structure and asymmetry.
     """
     assert X_n.shape == (42, 42), f"Expect (nodes=42, features=42), got {X_n.shape}"
 
@@ -557,6 +766,7 @@ def build_graph_features_for_patient(X_n):
     h_mean = H.mean(axis=1)   # 42
     h_std  = H.std(axis=1)    # 42
     h_max  = H.max(axis=1)    # 42
+    h_min  = H.min(axis=1)    # 42
 
     # Step 1.8: Left / Right asymmetry (PD hallmark)
     H_left  = H[:21]           # (21, 42)
@@ -569,15 +779,15 @@ def build_graph_features_for_patient(X_n):
     A_RR = A[21:, 21:]
     A_LR = A[:21, 21:]
     block_stats = np.array([
-        A_LL.mean(), A_LL.std(), A_LL.max(), A_LL.sum() / (21 * 21),
-        A_RR.mean(), A_RR.std(), A_RR.max(), A_RR.sum() / (21 * 21),
-        A_LR.mean(), A_LR.std(), A_LR.max(), A_LR.sum() / (21 * 21),
+        A_LL.mean(), A_LL.std(), A_LL.max(), A_LL.min(),
+        A_RR.mean(), A_RR.std(), A_RR.max(), A_RR.min(),
+        A_LR.mean(), A_LR.std(), A_LR.max(), A_LR.min(),
     ])  # 12
     coupling_asymmetry = float(np.abs(A_LL.mean() - A_RR.mean()))  # 1
 
-    # Step 1.10: Concatenate → 161 dims
+    # Step 1.10: Concatenate → 203 dims
     return np.concatenate([
-        h_mean, h_std, h_max,
+        h_mean, h_std, h_max, h_min,
         asymmetry_vec, [asymmetry_scalar],
         block_stats, [coupling_asymmetry],
     ])
@@ -588,7 +798,7 @@ def build_graph_features(X_patients, n_joints=42):
     X_patients : (N, n_features) DataFrame or ndarray.
     Reshapes each row into (n_joints, k) then pads/truncates k to 42
     before calling build_graph_features_for_patient.
-    Returns V_all of shape (N, 161).
+    Returns V_all of shape (N, 203).
     """
     X = np.array(X_patients, dtype=float)
     N, n_feats = X.shape
@@ -604,20 +814,21 @@ def build_graph_features(X_patients, n_joints=42):
             X_n = X_n[:, :42]
         vectors.append(build_graph_features_for_patient(X_n))
 
-    return np.array(vectors)  # (N, 161)
+    return np.array(vectors)  # (N, 203)
 
 
 _GRAPH_FEAT_NAMES = (
     [f"gcn_mean_{i}" for i in range(42)] +
     [f"gcn_std_{i}"  for i in range(42)] +
     [f"gcn_max_{i}"  for i in range(42)] +
+    [f"gcn_min_{i}"  for i in range(42)] +
     [f"asym_vec_{i}" for i in range(21)] +
     ["asym_scalar"] +
-    [f"blk_LL_{s}" for s in ("mean", "std", "max", "density")] +
-    [f"blk_RR_{s}" for s in ("mean", "std", "max", "density")] +
-    [f"blk_LR_{s}" for s in ("mean", "std", "max", "density")] +
+    [f"blk_LL_{s}" for s in ("mean", "std", "max", "min")] +
+    [f"blk_RR_{s}" for s in ("mean", "std", "max", "min")] +
+    [f"blk_LR_{s}" for s in ("mean", "std", "max", "min")] +
     ["coupling_asym"]
-)  # 161
+)  # 203
 
 
 # ==========================================
@@ -749,7 +960,7 @@ def run_graph_loocv(X, y_binary, args, dataset_name, hand_label="Both",
 
     try:
         V_all = build_graph_features(X)
-        print(f"Graph feature matrix: {V_all.shape}  (target: N × 161)")
+        print(f"Graph feature matrix: {V_all.shape}  (target: N × 203)")
     except Exception as e:
         print(f"Graph feature construction failed: {e}")
         return
@@ -1011,7 +1222,13 @@ def main():
     parser.add_argument('--diff_abs', action='store_true', help="Use absolute difference |L - R| instead of L - R")
     parser.add_argument('--cross_dataset', action='store_true', help="Train on 2020 (old) and test on 2025 (horizontal). Ignores --dataset_source if set.")
     parser.add_argument('--use_lda', action='store_true', help="Enable LDA (Multi-class) + XGB method in Standard mode")
-    
+    parser.add_argument('--label_col', type=str, choices=['pd_stage', 'Dominant'], default='pd_stage',
+                        help="Which column to use as the prediction label. 'pd_stage' (default): binary Healthy/PD via pd_stage>0. "
+                             "'Dominant': classification directly on the Dominant column (rows with missing/'1+2' Dominant are dropped).")
+    parser.add_argument('--dominant_binary', action='store_true',
+                        help="Only used with --label_col Dominant. Restrict to rows where Dominant is 1 or 2 "
+                             "(drop 0 and '1+2') and run binary classification (1 vs 2) instead of the 0/1/2 multiclass task.")
+
     args = parser.parse_args()
     
     try:
@@ -1029,7 +1246,7 @@ def main():
     else:
         target_datasets = [args.dataset_source]
 
-    metadata_cols = ['patient_id', 'date', 'pd_stage', 'on_medication', 'dataset_source']
+    metadata_cols = ['patient_id', 'date', 'pd_stage', 'on_medication', 'dataset_source', 'Dominant']
 
     # 定義使用的特徵選擇方法
     fs_methods = [
@@ -1037,6 +1254,18 @@ def main():
         ("L1-Regularization + XGB", logistic_l1_fs),
         ("XGB Importance + XGB", xgboost_fs)
     ]
+
+    if args.dominant_binary and args.label_col != 'Dominant':
+        print("錯誤: --dominant_binary 只能搭配 --label_col Dominant 使用。")
+        return
+
+    if args.label_col == 'Dominant':
+        if 'Dominant' not in df_full.columns:
+            print("錯誤: --label_col Dominant 需要 CSV 內含 'Dominant' 欄位 (請使用合併過 Dominant 的特徵檔)。")
+            return
+        if args.cross_dataset:
+            print("錯誤: --label_col Dominant 不支援 --cross_dataset (Dominant 僅存在於 2025/horizontal 資料，old 資料集沒有對應值)。")
+            return
 
     if args.cross_dataset:
         print(f"\n{'='*70}")
@@ -1136,6 +1365,26 @@ def main():
             if n_dropped > 0:
                 print(f"移除 {n_dropped} 筆重複資料 (同 patient_id + 同 date)")
 
+        if args.label_col == 'Dominant':
+            dom_str = df_subset['Dominant'].astype(str).str.strip()
+            if args.dominant_binary:
+                # 只保留 Dominant 為 1 或 2 的資料列 (0 與 '1+2'、缺值皆排除)，做 1 vs 2 二元分類。
+                valid_mask = dom_str.isin(['1', '2'])
+                n_excluded = len(df_subset) - valid_mask.sum()
+                if n_excluded > 0:
+                    print(f"排除 {n_excluded} 筆 Dominant 非 1/2 (含 0、'1+2'、缺失) 的資料列")
+                df_subset = df_subset[valid_mask].copy()
+                # 對應到既有二元分類流程需要的 0/1 標籤: 1 -> 0, 2 -> 1
+                df_subset['Dominant'] = dom_str[valid_mask].map({'1': 0, '2': 1}).astype(int)
+            else:
+                # 只保留 Dominant 為單一有效類別 (0/1/2) 的資料列；缺值、'-'、'1+2' 視為缺失並排除。
+                valid_mask = dom_str.isin(['0', '1', '2'])
+                n_excluded = len(df_subset) - valid_mask.sum()
+                if n_excluded > 0:
+                    print(f"排除 {n_excluded} 筆 Dominant 缺失/無效 (含 '1+2') 的資料列")
+                df_subset = df_subset[valid_mask].copy()
+                df_subset['Dominant'] = dom_str[valid_mask].astype(int)
+
         print(f"符合條件的樣本數 (No Med): {len(df_subset)}")
         if len(df_subset) < 5:
             print("樣本數不足 (< 5)，跳過。")
@@ -1143,6 +1392,10 @@ def main():
 
         y_binary = pd.Series((df_subset['pd_stage'] > 0).astype(int).values)
         y_multi = pd.Series(df_subset['pd_stage'].fillna(0).astype(int).values)
+        y_dominant = pd.Series(df_subset['Dominant'].values) if args.label_col == 'Dominant' else None
+
+        meta_cols = [c for c in ['patient_id', 'date', 'pd_stage'] if c in df_subset.columns]
+        patient_meta = df_subset[meta_cols].reset_index(drop=True)
 
         X_all = df_subset.drop(columns=[c for c in metadata_cols if c in df_subset.columns])
         X_all = X_all.select_dtypes(include=[np.number]).reset_index(drop=True)
@@ -1161,28 +1414,65 @@ def main():
                     diff_count += 1
             print(f"已新增 {diff_count} 個左右手差距特徵 (Diff_)。總特徵數: {X_all.shape[1]}")
 
-        if args.mode in ['standard', 'all']:
-            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
-            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
-            hand_label = "Both"
-            if len(left_cols) > 0 and len(right_cols) == 0:
-                hand_label = "Left"
-            elif len(right_cols) > 0 and len(left_cols) == 0:
-                hand_label = "Right"
+        left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
+        right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
+        hand_label = "Both"
+        if len(left_cols) > 0 and len(right_cols) == 0:
+            hand_label = "Left"
+        elif len(right_cols) > 0 and len(left_cols) == 0:
+            hand_label = "Right"
 
-            run_standard_loocv(X_all, y_binary, y_multi, args, source_name, fs_methods, hand_label=hand_label)
+        if args.label_col == 'Dominant' and args.dominant_binary:
+            # Dominant 已篩選為僅 1/2 並對應成 0/1，沿用既有的二元分類流程 (含 ROC/AUC/Youden)。
+            if args.mode in ['standard', 'all']:
+                run_standard_loocv(X_all, y_dominant, y_dominant, args, source_name, fs_methods, hand_label=hand_label, patient_meta=patient_meta)
+
+            if args.mode in ['separate_hands', 'all']:
+                if len(left_cols) > 0:
+                    run_standard_loocv(X_all[left_cols], y_dominant, y_dominant, args, source_name, fs_methods, hand_label="Left", patient_meta=patient_meta)
+                if len(right_cols) > 0:
+                    run_standard_loocv(X_all[right_cols], y_dominant, y_dominant, args, source_name, fs_methods, hand_label="Right", patient_meta=patient_meta)
+
+            if args.mode in ['graph', 'all']:
+                if left_cols and right_cols:
+                    run_graph_loocv(X_all[left_cols + right_cols], y_dominant, args, source_name,
+                                    hand_label="Both", y_stage=y_dominant)
+                elif left_cols:
+                    run_graph_loocv(X_all[left_cols], y_dominant, args, source_name,
+                                    hand_label="Left", y_stage=y_dominant)
+                elif right_cols:
+                    run_graph_loocv(X_all[right_cols], y_dominant, args, source_name,
+                                    hand_label="Right", y_stage=y_dominant)
+                else:
+                    run_graph_loocv(X_all, y_dominant, args, source_name, y_stage=y_dominant)
+
+            continue
+
+        if args.label_col == 'Dominant':
+            if args.mode in ['standard', 'all']:
+                run_standard_loocv_multiclass(X_all, y_dominant, args, source_name, fs_methods, hand_label=hand_label)
+
+            if args.mode in ['separate_hands', 'all']:
+                if len(left_cols) > 0:
+                    run_standard_loocv_multiclass(X_all[left_cols], y_dominant, args, source_name, fs_methods, hand_label="Left")
+                if len(right_cols) > 0:
+                    run_standard_loocv_multiclass(X_all[right_cols], y_dominant, args, source_name, fs_methods, hand_label="Right")
+
+            if args.mode in ['graph', 'all']:
+                print("提示: --label_col Dominant 目前不支援 graph 模式，已略過。")
+
+            continue
+
+        if args.mode in ['standard', 'all']:
+            run_standard_loocv(X_all, y_binary, y_multi, args, source_name, fs_methods, hand_label=hand_label, patient_meta=patient_meta)
 
         if args.mode in ['separate_hands', 'all']:
-            left_cols = [c for c in X_all.columns if str(c).startswith('L_')]
-            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
             if len(left_cols) > 0:
-                run_standard_loocv(X_all[left_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Left")
+                run_standard_loocv(X_all[left_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Left", patient_meta=patient_meta)
             if len(right_cols) > 0:
-                run_standard_loocv(X_all[right_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Right")
+                run_standard_loocv(X_all[right_cols], y_binary, y_multi, args, source_name, fs_methods, hand_label="Right", patient_meta=patient_meta)
 
         if args.mode in ['graph', 'all']:
-            left_cols  = [c for c in X_all.columns if str(c).startswith('L_')]
-            right_cols = [c for c in X_all.columns if str(c).startswith('R_')]
             if left_cols and right_cols:
                 run_graph_loocv(X_all[left_cols + right_cols], y_binary, args, source_name,
                                 hand_label="Both", y_stage=y_multi)

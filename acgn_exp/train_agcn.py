@@ -47,16 +47,18 @@ def _average_fold_histories(fold_lists):
     return means, stds
 
 def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
-                         save_dir, model_key, dataset_name, is_cross_dataset=False):
-    """Plot training loss (+ validation loss) and validation RMSE curves."""
+                         save_dir, model_key, dataset_name, is_cross_dataset=False,
+                         train_rmse_folds=None):
+    """Plot training loss (+ validation loss) and training/validation RMSE curves."""
     train_mean, train_std = _average_fold_histories(train_loss_folds)
     if not train_mean:
         return
 
-    has_val  = bool(val_loss_folds  and val_loss_folds[0])
-    has_rmse = bool(val_rmse_folds  and val_rmse_folds[0])
+    has_val       = bool(val_loss_folds   and val_loss_folds[0])
+    has_rmse      = bool(val_rmse_folds   and val_rmse_folds[0])
+    has_train_rmse = bool(train_rmse_folds and train_rmse_folds[0])
 
-    n_plots = 1 + int(has_rmse)
+    n_plots = 1 + int(has_rmse or has_train_rmse)
     fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 5))
     if n_plots == 1:
         axes = [axes]
@@ -88,18 +90,31 @@ def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── Plot 2: Val RMSE
-    if has_rmse:
-        rmse_mean, rmse_std = _average_fold_histories(val_rmse_folds)
-        epochs_rmse = range(1, len(rmse_mean) + 1)
+    # ── Plot 2: Train / Val RMSE
+    if has_rmse or has_train_rmse:
         ax2 = axes[1]
-        ax2.plot(epochs_rmse, rmse_mean, 'g-', linewidth=2, label=f'Val RMSE {fold_label}')
-        if n_folds > 1:
-            ax2.fill_between(epochs_rmse, np.array(rmse_mean) - np.array(rmse_std),
-                             np.array(rmse_mean) + np.array(rmse_std), alpha=0.2, color='green')
+
+        if has_train_rmse:
+            train_rmse_mean, train_rmse_std = _average_fold_histories(train_rmse_folds)
+            epochs_train_rmse = range(1, len(train_rmse_mean) + 1)
+            ax2.plot(epochs_train_rmse, train_rmse_mean, 'b-', linewidth=2, label=f'Train RMSE {fold_label}')
+            if n_folds > 1:
+                ax2.fill_between(epochs_train_rmse,
+                                 np.array(train_rmse_mean) - np.array(train_rmse_std),
+                                 np.array(train_rmse_mean) + np.array(train_rmse_std),
+                                 alpha=0.2, color='blue')
+
+        if has_rmse:
+            rmse_mean, rmse_std = _average_fold_histories(val_rmse_folds)
+            epochs_rmse = range(1, len(rmse_mean) + 1)
+            ax2.plot(epochs_rmse, rmse_mean, 'g-', linewidth=2, label=f'Val RMSE {fold_label}')
+            if n_folds > 1:
+                ax2.fill_between(epochs_rmse, np.array(rmse_mean) - np.array(rmse_std),
+                                 np.array(rmse_mean) + np.array(rmse_std), alpha=0.2, color='green')
+
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('RMSE (prob vs label)')
-        ax2.set_title('Validation RMSE')
+        ax2.set_title('Training / Validation RMSE')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
@@ -251,6 +266,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
     total_loss = 0
     correct = 0
     total = 0
+    all_probs, all_targets = [], []
     for batch_idx, (data, target) in enumerate(loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
@@ -260,9 +276,15 @@ def train_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
         total_loss += loss.item()
         pred = output.argmax(dim=1)
+        prob = torch.softmax(output, dim=1)[:, 1]
         correct += pred.eq(target).sum().item()
         total += target.size(0)
-    return total_loss / len(loader), correct / total
+        all_probs.extend(prob.detach().cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
+
+    # RMSE calculation (probability vs ground truth), same definition as evaluate()
+    rmse = np.sqrt(np.mean((np.array(all_probs) - np.array(all_targets))**2))
+    return total_loss / len(loader), correct / total, rmse
 
 def evaluate(model, loader, criterion, device):
     model.eval()
@@ -316,6 +338,7 @@ def main():
     all_targets, all_probs = [], []
     
     train_loss_folds = []
+    train_rmse_folds = []
     val_loss_folds = []
     val_rmse_folds = []
     
@@ -383,12 +406,14 @@ def main():
         patience_counter = 0
 
         fold_train_loss = []
+        fold_train_rmse = []
         fold_val_loss = []
         fold_val_rmse = []
 
         for epoch in range(args.epochs):
-            t_loss, t_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+            t_loss, t_acc, t_rmse = train_epoch(model, train_loader, criterion, optimizer, device)
             fold_train_loss.append(t_loss)
+            fold_train_rmse.append(t_rmse)
 
             # Validation strictly for early stopping and tracking curves
             v_loss, v_acc, _, _, _, v_rmse = evaluate(model, val_loader, criterion, device)
@@ -396,7 +421,7 @@ def main():
             fold_val_rmse.append(v_rmse)
 
             print(f"  Epoch {epoch+1:3d}/{args.epochs} | "
-                  f"Train Loss: {t_loss:.4f}  Acc: {t_acc:.4f} | "
+                  f"Train Loss: {t_loss:.4f}  Acc: {t_acc:.4f}  RMSE: {t_rmse:.4f} | "
                   f"Val Loss: {v_loss:.4f}  Acc: {v_acc:.4f}  RMSE: {v_rmse:.4f} | "
                   f"Patience: {patience_counter}/{args.patience}")
 
@@ -410,6 +435,7 @@ def main():
                     break
 
         train_loss_folds.append(fold_train_loss)
+        train_rmse_folds.append(fold_train_rmse)
         val_loss_folds.append(fold_val_loss)
         val_rmse_folds.append(fold_val_rmse)
 
@@ -436,10 +462,11 @@ def main():
                             save_dir=args.save_dir)
                             
     plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
-                         save_dir=args.save_dir, 
-                         model_key=args.adj_mode, 
-                         dataset_name=dataset_name_plot, 
-                         is_cross_dataset=args.cross_dataset)
+                         save_dir=args.save_dir,
+                         model_key=args.adj_mode,
+                         dataset_name=dataset_name_plot,
+                         is_cross_dataset=args.cross_dataset,
+                         train_rmse_folds=train_rmse_folds)
                          
     print(f"\n{cv_name} Training complete! Saved results to {args.save_dir}")
 

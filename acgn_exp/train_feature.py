@@ -93,22 +93,31 @@ def train_epoch(model, loader, criterion, optimizer, device):
     total_loss = 0
     correct = 0
     total = 0
-    
+    all_probs = []
+    all_targets = []
+
     for batch_idx, (data, target) in enumerate(loader):
         data, target = data.to(device), target.to(device)
-        
+
         optimizer.zero_grad()
         output = model(data)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
-        
+
         total_loss += loss.item()
+        prob = torch.softmax(output, dim=1)
         pred = output.argmax(dim=1)
         correct += pred.eq(target).sum().item()
         total += target.size(0)
-    
-    return total_loss / len(loader), correct / total
+        all_probs.extend(prob[:, 1].detach().cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
+
+    # RMSE calculation (probability vs ground truth), same definition as evaluate()
+    rmse = float(np.sqrt(np.mean(
+        (np.array(all_probs) - np.array(all_targets, dtype=float)) ** 2
+    )))
+    return total_loss / len(loader), correct / total, rmse
 
 
 def evaluate(model, loader, criterion, device):
@@ -271,9 +280,10 @@ def _average_fold_histories(fold_lists):
 
 
 def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
-                         save_dir, model_key, dataset_name, is_cross_dataset=False):
+                         save_dir, model_key, dataset_name, is_cross_dataset=False,
+                         train_rmse_folds=None):
     """
-    Plot training loss (+ validation loss) and validation RMSE curves.
+    Plot training loss (+ validation loss) and training/validation RMSE curves.
 
     When multiple folds are provided the curves are averaged; shaded regions
     show ±1 std across folds.
@@ -286,6 +296,7 @@ def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
         train_loss_folds: list of per-fold train-loss lists  [[ep0, ep1, ...], ...]
         val_loss_folds:   list of per-fold val-loss  lists   (empty for cross-dataset)
         val_rmse_folds:   list of per-fold val-RMSE  lists   (empty for cross-dataset)
+        train_rmse_folds: list of per-fold train-RMSE lists  (empty for cross-dataset)
         save_dir:         directory to save the figure
         model_key:        identifier string (e.g. 'separate_block')
         dataset_name:     used in figure title / filename
@@ -295,10 +306,11 @@ def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
     if not train_mean:
         return
 
-    has_val  = bool(val_loss_folds  and val_loss_folds[0])
-    has_rmse = bool(val_rmse_folds  and val_rmse_folds[0])
+    has_val        = bool(val_loss_folds   and val_loss_folds[0])
+    has_rmse       = bool(val_rmse_folds   and val_rmse_folds[0])
+    has_train_rmse = bool(train_rmse_folds and train_rmse_folds[0])
 
-    n_plots = 1 + int(has_rmse)
+    n_plots = 1 + int(has_rmse or has_train_rmse)
     fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 5))
     if n_plots == 1:
         axes = [axes]
@@ -336,21 +348,35 @@ def plot_training_curves(train_loss_folds, val_loss_folds, val_rmse_folds,
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── Plot 2: Val RMSE ─────────────────────────────────────────────────────
-    if has_rmse:
-        rmse_mean, rmse_std = _average_fold_histories(val_rmse_folds)
-        epochs_rmse = range(1, len(rmse_mean) + 1)
+    # ── Plot 2: Train / Val RMSE ─────────────────────────────────────────────
+    if has_rmse or has_train_rmse:
         ax2 = axes[1]
-        ax2.plot(epochs_rmse, rmse_mean, 'g-', linewidth=2,
-                 label=f'Val RMSE {fold_label}')
-        if n_folds > 1:
-            r_arr = np.array(rmse_mean)
-            rs_arr = np.array(rmse_std)
-            ax2.fill_between(epochs_rmse, r_arr - rs_arr, r_arr + rs_arr,
-                             alpha=0.2, color='green')
+
+        if has_train_rmse:
+            train_rmse_mean, train_rmse_std = _average_fold_histories(train_rmse_folds)
+            epochs_train_rmse = range(1, len(train_rmse_mean) + 1)
+            ax2.plot(epochs_train_rmse, train_rmse_mean, 'b-', linewidth=2,
+                     label=f'Train RMSE {fold_label}')
+            if n_folds > 1:
+                tr_arr = np.array(train_rmse_mean)
+                trs_arr = np.array(train_rmse_std)
+                ax2.fill_between(epochs_train_rmse, tr_arr - trs_arr, tr_arr + trs_arr,
+                                 alpha=0.2, color='blue')
+
+        if has_rmse:
+            rmse_mean, rmse_std = _average_fold_histories(val_rmse_folds)
+            epochs_rmse = range(1, len(rmse_mean) + 1)
+            ax2.plot(epochs_rmse, rmse_mean, 'g-', linewidth=2,
+                     label=f'Val RMSE {fold_label}')
+            if n_folds > 1:
+                r_arr = np.array(rmse_mean)
+                rs_arr = np.array(rmse_std)
+                ax2.fill_between(epochs_rmse, r_arr - rs_arr, r_arr + rs_arr,
+                                 alpha=0.2, color='green')
+
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('RMSE  (prob vs label)')
-        ax2.set_title('Validation RMSE')
+        ax2.set_title('Training / Validation RMSE')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
@@ -581,7 +607,7 @@ def main():
         dataset_name_plot = args.dataset_source
 
     # Collect per-epoch metrics (list of per-fold lists)
-    training_histories = {'train_loss': [], 'val_loss': [], 'val_rmse': []}
+    training_histories = {'train_loss': [], 'train_rmse': [], 'val_loss': [], 'val_rmse': []}
 
     for fold_idx, train_idx, val_idx in cv_splits:
         if not args.cross_dataset:
@@ -610,13 +636,15 @@ def main():
         patience_counter = 0
 
         fold_train_losses = []
+        fold_train_rmses  = []
         fold_val_losses   = []
         fold_val_rmses    = []
 
         fold_label = f"fold {fold_idx}" if not args.cross_dataset else "cross-dataset"
         for epoch in range(args.epochs):
-            train_loss, _ = train_epoch(model, train_loader, criterion, optimizer, device)
+            train_loss, _, train_rmse = train_epoch(model, train_loader, criterion, optimizer, device)
             fold_train_losses.append(train_loss)
+            fold_train_rmses.append(train_rmse)
 
             if args.cross_dataset:
                 val_loss, val_acc, _, _tgt_ep, _prob_ep = evaluate(model, es_val_loader, criterion, device)
@@ -630,8 +658,8 @@ def main():
             fold_val_rmses.append(val_rmse)
             scheduler.step(val_loss)
             print(f"  {fold_label} | epoch {epoch+1:>4}/{args.epochs}"
-                  f" | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}"
-                  f" | val_acc {val_acc:.3f} | val_rmse {val_rmse:.4f}"
+                  f" | train_loss {train_loss:.4f} | train_rmse {train_rmse:.4f}"
+                  f" | val_loss {val_loss:.4f} | val_acc {val_acc:.3f} | val_rmse {val_rmse:.4f}"
                   f" | patience {patience_counter}/{args.patience}", end='\r')
 
             if val_loss < best_loss:
@@ -648,6 +676,7 @@ def main():
             print()
 
         training_histories['train_loss'].append(fold_train_losses)
+        training_histories['train_rmse'].append(fold_train_rmses)
         training_histories['val_loss'].append(fold_val_losses)
         training_histories['val_rmse'].append(fold_val_rmses)
 
@@ -690,7 +719,8 @@ def main():
         save_dir=args.save_dir,
         model_key='AGCN (Linear)',
         dataset_name=dataset_name_plot,
-        is_cross_dataset=args.cross_dataset
+        is_cross_dataset=args.cross_dataset,
+        train_rmse_folds=training_histories['train_rmse']
     )
     
     if args.cross_dataset:
@@ -734,7 +764,7 @@ def main():
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
         for epoch in range(args.epochs):
-            train_loss, _ = train_epoch(final_model, full_loader, criterion, optimizer, device)
+            train_loss, _, _ = train_epoch(final_model, full_loader, criterion, optimizer, device)
             scheduler.step(train_loss)
 
         if hasattr(final_model, 'analyze_adjacency'):
